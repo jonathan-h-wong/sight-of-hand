@@ -42,6 +42,7 @@ apt-get -qq install -y git >/dev/null 2>&1
 git clone -q --depth 1 https://github.com/valeoai/NAF $R/NAF || finish FAILED
 export NAF_DIR=$R/NAF
 mkdir -p code && aws s3 cp --quiet $W/code_sight_of_hand.tar.gz - | tar -xzf - -C code || finish FAILED
+until aws s3 ls $DATA_PREFIX/index.parquet > /dev/null 2>&1; do sleep 30; done  # the dataset build writes it last
 log "download shards"; push_status
 mkdir -p $R/data/shards
 aws s3 sync --quiet $DATA_PREFIX/shards $R/data/shards --exclude "*" --include "train_*" --include "val_*" || finish FAILED
