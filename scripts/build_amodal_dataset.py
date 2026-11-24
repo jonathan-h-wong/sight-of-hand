@@ -50,6 +50,36 @@ OUT_RES = 640
 PER_SHARD = 2000
 
 
+class ResumableS3(io.RawIOBase):
+    """Sequential reader over an S3 object that re-requests from the current byte after a dropped connection."""
+
+    def __init__(self, s3, key, tries=20):
+        self.s3, self.key, self.pos, self.tries = s3, key, 0, tries
+        self.size = s3.head_object(Bucket=BUCKET, Key=key)["ContentLength"]
+        self.body = None
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        if self.pos >= self.size:
+            return 0
+        for t in range(self.tries):
+            try:
+                if self.body is None:
+                    self.body = self.s3.get_object(Bucket=BUCKET, Key=self.key, Range=f"bytes={self.pos}-")["Body"]
+                data = self.body.read(len(b))
+                if not data and self.pos < self.size:
+                    raise IOError("short read")
+                b[:len(data)] = data
+                self.pos += len(data)
+                return len(data)
+            except Exception:
+                self.body = None
+                time.sleep(min(30, 2 ** t))
+        raise IOError(f"{self.key}: gave up at byte {self.pos}")
+
+
 def split_of(subject_i, seq_i):
     if seq_i % 5 != 4:
         return "train"
@@ -75,7 +105,7 @@ def crop(img, masks, box, H, W):
 
 
 def process_subject(args):
-    subject_i, stride, prefix, max_seqs = args
+    subject_i, stride, prefix, max_seqs, local_tar = args
     import boto3
     s3 = boto3.client("s3")
     subj = SUBJECTS[subject_i]
@@ -167,7 +197,7 @@ def process_subject(args):
         w["n"] += 1
         out_rows.append({"key": k, "shard": w["name"], **meta})
 
-    body = s3.get_object(Bucket=BUCKET, Key=f"raw/dexycb/{subj}.tar.gz")["Body"]
+    body = open(local_tar, "rb") if local_tar else io.BufferedReader(ResumableS3(s3, f"raw/dexycb/{subj}.tar.gz"), 1 << 22)
     with tarfile.open(fileobj=body, mode="r|gz") as tf:
         for m in tf:
             p = m.name.split("/")
@@ -213,10 +243,11 @@ def main():
     ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--out-prefix", default="train/amodal_dexycb_s0_v1")
     ap.add_argument("--max-seqs", type=int, default=0, help="test: only the first N sequences per subject")
+    ap.add_argument("--local-tar", help="test: read this local .tar.gz instead of the subject archive on S3")
     a = ap.parse_args()
     subs = list(range(10)) if a.subjects == "all" else [int(x) for x in a.subjects.split(",")]
     with Pool(min(a.workers, len(subs))) as pool:
-        for subj, n, orphan, dt in pool.imap_unordered(process_subject, [(i, a.stride, a.out_prefix, a.max_seqs) for i in subs]):
+        for subj, n, orphan, dt in pool.imap_unordered(process_subject, [(i, a.stride, a.out_prefix, a.max_seqs, a.local_tar) for i in subs]):
             print(f"{subj}: {n} samples, {orphan} unpaired, {dt:.0f}s", flush=True)
     import boto3
     s3 = boto3.client("s3")
