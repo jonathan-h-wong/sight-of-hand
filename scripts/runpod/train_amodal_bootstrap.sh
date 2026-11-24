@@ -51,8 +51,8 @@ log "data: $(ls $R/data/shards | wc -l) shards, $(du -sh $R/data/shards | cut -f
 cd code
 NW=$(( $(nproc) > 16 ? 16 : $(nproc) ))
 log "smoke test"; push_status
-WANDB_MODE=disabled python scripts/train_amodal.py --data $R/data --steps 30 --val-every 30 --val-batches 2 \
+WANDB_MODE=disabled python3 scripts/train_amodal.py --data $R/data --steps 30 --val-every 30 --val-batches 2 \
   --workers $NW --s3-prefix "" --run-name smoke ${TRAIN_ARGS:-} > $R/status/smoke.log 2>&1 || finish FAILED
 log "train"; push_status
-python scripts/train_amodal.py --data $R/data --workers $NW ${TRAIN_ARGS:-} > $R/status/train.log 2>&1 || finish FAILED
+python3 scripts/train_amodal.py --data $R/data --workers $NW ${TRAIN_ARGS:-} > $R/status/train.log 2>&1 || finish FAILED
 finish DONE
