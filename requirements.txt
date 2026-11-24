@@ -1,0 +1,10 @@
+numpy
+scipy
+pandas
+pyarrow
+trimesh
+embreex
+pillow
+pyyaml
+boto3
+libigl
