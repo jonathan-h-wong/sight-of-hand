@@ -85,7 +85,7 @@ def main():
     a = ap.parse_args()
     torch.manual_seed(a.seed)
     random.seed(a.seed)
-    device = "cuda"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
@@ -96,7 +96,7 @@ def main():
     val.sort(key=lambda it: it["key"])
     print(f"train {len(train)} samples ({len({it['meta']['seq'] for it in train})} seqs), val {len(val)}", flush=True)
     dl = DataLoader(D.AmodalShards(train, True), batch_size=a.batch, shuffle=True, num_workers=a.workers,
-                    collate_fn=D.collate, drop_last=True, pin_memory=True, persistent_workers=True)
+                    collate_fn=D.collate, drop_last=True, pin_memory=True, persistent_workers=a.workers > 0)
     vdl = DataLoader(D.AmodalShards(val, False), batch_size=a.batch, shuffle=False, num_workers=a.workers,
                      collate_fn=D.collate, pin_memory=True)
     vis = D.collate([D.AmodalShards(val, False)[i] for i in np.linspace(0, len(val) - 1, 8).astype(int)])

@@ -59,7 +59,10 @@ class AmodalShards(Dataset):
         s = NOMINAL * r.uniform(0.85, 1.15)
         cx = CTX / 2 + r.uniform(-0.1, 0.1) * s
         cy = CTX / 2 + r.uniform(-0.1, 0.1) * s
-        return (cx - s / 2, cy - s / 2, s)
+        # keep the box inside the stored context (max side 1.15 * 480 = 552 < 640, so only a shift is needed)
+        x0 = min(max(0.0, cx - s / 2), CTX - s)
+        y0 = min(max(0.0, cy - s / 2), CTX - s)
+        return (x0, y0, s)
 
     def __getitem__(self, i):
         it = self.items[i]

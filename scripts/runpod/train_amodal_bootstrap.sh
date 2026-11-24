@@ -12,7 +12,7 @@ R=/workspace/amodal_net; mkdir -p $R/status && cd $R
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a $R/status/pod.log; }
 push_status() { aws s3 sync --quiet $R/status $W/status; }
 finish() {
-  log "$1"; echo "$1" > $R/status/STATE; push_status
+  log "$1"; echo "$1" > $R/status/STATE; push_status; aws s3 sync --quiet $R/wandb $W/wandb 2>/dev/null
   local m; [ "$1" = DONE ] && m=podTerminate || m=podStop
   if command -v runpodctl > /dev/null; then
     if [ "$1" = DONE ]; then runpodctl remove pod "$RUNPOD_POD_ID"; else runpodctl stop pod "$RUNPOD_POD_ID"; fi
@@ -22,8 +22,14 @@ finish() {
   fi
   sleep infinity
 }
-syncer() { while true; do sleep 120; push_status; done; }
+# W&B: online when WANDB_API_KEY is set; otherwise offline runs in $R/wandb, synced to $W/wandb/ for a later
+# `wandb sync` (aws s3 sync s3://xray-hands/work/amodal_net/wandb ./wandb && wandb sync ./wandb/offline-run-*)
+export WANDB_DIR=$R
+if [ -z "${WANDB_API_KEY:-}" ]; then export WANDB_MODE=offline; fi
+mkdir -p $R/wandb
+syncer() { while true; do sleep 120; push_status; aws s3 sync --quiet $R/wandb $W/wandb; done; }
 
+log "W&B mode: ${WANDB_MODE:-online}"
 log "start; $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader); vCPU $(nproc)"
 echo RUNNING > $R/status/STATE; push_status
 syncer &
