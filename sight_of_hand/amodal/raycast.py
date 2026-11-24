@@ -7,8 +7,6 @@ A ray goes through each pixel centre. Rays are only cast inside the projected bo
 cost scales with the size of the hand/object on screen, not the image.
 """
 import numpy as np
-import trimesh
-from trimesh.ray.ray_pyembree import RayMeshIntersector
 
 NEAR = 1e-3  # metres; vertices closer than this (or behind the camera) make the box fall back to the full image
 
@@ -43,6 +41,8 @@ def _first_hit(meshes, K, H, W, box):
         Fs.append(F + off)
         owner.append(np.full(len(F), i, np.int32))
         off += len(V)
+    import trimesh  # imported here so pack/unpack users need neither trimesh nor embreex
+    from trimesh.ray.ray_pyembree import RayMeshIntersector
     m = trimesh.Trimesh(np.concatenate(Vs), np.concatenate(Fs), process=False)
     o, d = _rays(K, x0, x1, y0, y1)
     tri = RayMeshIntersector(m).intersects_first(o, d)
