@@ -10,7 +10,8 @@ J=s3://xray-hands/work/b0/jobs/$JOB
 R=/workspace/run; mkdir -p $R/status /workspace/out && cd $R
 export OUT=/workspace/out
 log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a $R/status/pod.log; }
-push() { aws s3 sync --quiet $R/status $J/status; aws s3 sync --quiet $OUT $J/out --exclude "*/renders_cond/*" --exclude "*_latents/*" --exclude "data/*"; }
+FG=s3://xray-hands/work/b0/flex_gemm_autotune_cache.json  # FlexGEMM kernel tuning, shared across pods
+push() { [ -f /root/.flex_gemm/autotune_cache.json ] && aws s3 cp --quiet /root/.flex_gemm/autotune_cache.json $FG; aws s3 sync --quiet $R/status $J/status; aws s3 sync --quiet $OUT $J/out --exclude "*/renders_cond/*" --exclude "*_latents/*" --exclude "data/*"; }
 die() {
   log "$1"; echo "$1" > $R/status/STATE; push
   if command -v runpodctl > /dev/null; then runpodctl remove pod "$RUNPOD_POD_ID"
@@ -26,6 +27,7 @@ log "start $JOB; $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheade
 echo RUNNING > $R/status/STATE; push
 aws s3 cp --quiet s3://xray-hands/work/b0/code/b0_gpu_setup.sh $R/setup.sh && bash $R/setup.sh > $R/status/setup.log 2>&1 || die FAILED_SETUP
 source /root/b0env.sh
+mkdir -p /root/.flex_gemm && aws s3 cp --quiet $FG /root/.flex_gemm/autotune_cache.json 2>/dev/null || true
 mkdir -p /root/code && aws s3 cp --quiet s3://xray-hands/work/b0/code/code_sight_of_hand.tar.gz - | tar -xzf - -C /root/code || die FAILED_CODE
 export PYTHONPATH=/root/code:$PX:$EVAL
 log "setup ok ($ATTN_BACKEND)"; push
