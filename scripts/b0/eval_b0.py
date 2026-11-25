@@ -373,13 +373,27 @@ def main():
 
 
 def summarize(df):
-    num = [c for c in df.columns if "/" in c and df[c].dtype != object]
-    main = ["ss/iou", "gt_d/soup/f@2", "gt_d/soup/chamfer", "gt_d/hand/f@2", "gt_d/obj/f@2", "gt_d/rel_offset_mm",
+    """Medians per row/mode/matte/stratum. A mesh mode that produced no mesh (empty stage 1, decode error) is a
+    failure, not a missing value: its F-scores count as 0 and `failed` reports the rate (Chamfer stays NaN)."""
+    df = df.copy()
+    mesh = df["mode"] != "ss"
+    probe = "gt_d/soup/f@2" if "gt_d/soup/f@2" in df else None
+    failed = mesh & (df["error"].notna() if "error" in df else False)
+    if probe:
+        failed = failed | (mesh & df[probe].isna())
+    df["failed"] = failed.astype(float)
+    for c in [c for c in df.columns if "/f@" in c]:
+        df.loc[failed, c] = 0.0
+    num = [c for c in df.columns if ("/" in c or c == "failed") and df[c].dtype != object]
+    main = ["failed", "ss/iou", "gt_d/soup/f@2", "gt_d/soup/chamfer", "gt_d/hand/f@2", "gt_d/obj/f@2", "gt_d/rel_offset_mm",
             "moge_d/soup/f@2", "norm/soup/f@2"]
     main = [c for c in main if c in df.columns]
     nonstress = df[df.set != "stress"]
     out = {"overall": nonstress.groupby(["row", "mode", "matte"])[num].median().round(4).reset_index()
-           .to_dict("records")}
+           .to_dict("records"),
+           "failure_rate": nonstress.groupby(["row", "mode", "matte"]).failed.mean().round(4).reset_index()
+           .to_dict("records"),
+           "n": nonstress.groupby(["row", "mode", "matte"]).size().rename("n").reset_index().to_dict("records")}
     for s in ("occ_bin", "kind"):
         out[f"by_{s}"] = nonstress.groupby(["row", "mode", "matte", s])[main].median().round(4).reset_index() \
             .to_dict("records")
