@@ -55,9 +55,18 @@ log "smoke test"; push_status
   python3 scripts/dump_overlays.py --data $R/data --ckpt runs/smoke/last.pt --out $R/smoke_ovl --per-bin 1; } \
   > $R/status/smoke.log 2>&1 || finish FAILED
 grep -E "NAF backward|trainable|step 30" $R/status/smoke.log | while read -r l; do log "smoke: $l"; done
-RUN=v2_${EXP}_$(date -u +%m%d_%H%M)
-log "train $RUN"; push_status
-python3 scripts/train_amodal_v2.py --data $R/data --exp $EXP --run-name $RUN --workers $NW ${TRAIN_ARGS:-} \
+# RESUME_RUN=<run name>: continue that run from s3://xray-hands/work/amodal_v2/runs/<run>/last.pt (and its best.pt)
+RES=()
+if [ -n "${RESUME_RUN:-}" ]; then
+  RUN=$RESUME_RUN; mkdir -p runs/$RUN
+  aws s3 cp --quiet $ROOT/runs/$RUN/last.pt runs/$RUN/last.pt || finish FAILED
+  aws s3 cp --quiet $ROOT/runs/$RUN/best.pt runs/$RUN/best.pt
+  RES=(--resume runs/$RUN/last.pt)
+else
+  RUN=v2_${EXP}_$(date -u +%m%d_%H%M)
+fi
+log "train $RUN ${RES[*]}"; push_status
+python3 scripts/train_amodal_v2.py --data $R/data --exp $EXP --run-name $RUN --workers $NW ${TRAIN_ARGS:-} "${RES[@]}" \
   > $R/status/train.log 2>&1 || finish FAILED
 log "overlays"; push_status
 python3 scripts/dump_overlays.py --data $R/data --ckpt runs/$RUN/best.pt --out $R/overlays --per-bin 50 \

@@ -139,6 +139,10 @@ def main():
     ap.add_argument("--wandb-project", default="sight-of-hand-amodal")
     ap.add_argument("--run-name")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--resume", type=Path, help="last.pt to continue from (same --run-name keeps the S3 run folder); a "
+                    "best.pt next to it sets the best score so far. Checkpoints without optimizer state resume with a "
+                    "fresh AdamW and a --rewarm-step linear re-warmup onto the original cosine schedule")
+    ap.add_argument("--rewarm", type=int, default=500)
     a = ap.parse_args()
     torch.manual_seed(a.seed)
     random.seed(a.seed)
@@ -166,8 +170,30 @@ def main():
     params = model.trainable()
     n_params = sum(p.numel() for p in params)
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=a.wd)
-    sched = torch.optim.lr_scheduler.LambdaLR(
-        opt, lambda s: min(1, (s + 1) / a.warmup) * 0.5 * (1 + math.cos(math.pi * min(1, s / a.steps))))
+    step0, best, rewarm, rck = 0, -1.0, 0, None
+    if a.resume:
+        rck = torch.load(a.resume, map_location="cpu", weights_only=False)
+        assert rck["config"]["decoder"] == cfg.decoder and list(rck["config"]["taps"]) == list(cfg.taps), rck["config"]
+        missing, unexpected = model.load_state_dict(rck["head"], strict=False)
+        missing = [k for k in missing if not k.startswith(("backbone.", "naf."))]
+        assert not missing and not unexpected, (missing, unexpected)
+        step0 = int(rck["step"])
+        if "opt" in rck:
+            opt.load_state_dict(rck["opt"])
+        else:
+            rewarm = a.rewarm
+        bp = a.resume.with_name("best.pt")
+        if bp.exists():
+            best = float(torch.load(bp, map_location="cpu", weights_only=False)["metrics"]["hidden_iou_occ10/mean"])
+        best = max(best, float(rck.get("best", -1.0)))
+        print(f"resumed {a.resume} at step {step0}; best so far {best:.4f}; "
+              f"{'optimizer state restored' if 'opt' in rck else f'fresh AdamW, {rewarm}-step re-warmup'}", flush=True)
+
+    def lr_factor(i):  # LambdaLR counts from 0 at construction; i + step0 is the global step
+        s = i + step0
+        w = min(1, (s + 1) / a.warmup) * (min(1, (i + 1) / rewarm) if rewarm else 1)
+        return w * 0.5 * (1 + math.cos(math.pi * min(1, s / a.steps)))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
 
     x0, y0, m0 = next(iter(dl))
     x0, y0 = x0.to(device), y0.to(device)
@@ -179,12 +205,12 @@ def main():
     meta_cfg = vars(a) | {"run": run, "head_params": n_params, "model": cfg.to_dict(), "naf_backward": naf_ok,
                           "naf_backward_msg": naf_msg, "train_samples": len(train), "val_samples": len(val)}
     import wandb
-    wandb.init(project=a.wandb_project, name=run, group="v2", config={k: str(v) if isinstance(v, Path) else v for k, v in meta_cfg.items()})
+    wandb.init(project=a.wandb_project, name=run + (f"_from{step0}" if step0 else ""), group="v2", config={k: str(v) if isinstance(v, Path) else v for k, v in meta_cfg.items()})
     print(f"run {run}: {n_params / 1e6:.2f}M trainable params; wandb {wandb.run.url if wandb.run else None}", flush=True)
     ck = a.ckpt_dir / run
     ck.mkdir(parents=True, exist_ok=True)
 
-    if a.diagnostics and device == "cuda":
+    if a.diagnostics and device == "cuda" and not step0:
         d = cost(model, x0)
         model.eval()
         evc = {}
@@ -200,13 +226,13 @@ def main():
         print("diagnostics", json.dumps(d), flush=True)
 
     def save(name, extra):
-        torch.save(head_state(model) | {"step": step, "metrics": extra, "args": {k: str(v) for k, v in vars(a).items()}},
-                   ck / name)
+        torch.save(head_state(model) | {"step": step, "metrics": extra, "best": best, "opt": opt.state_dict(),
+                                        "args": {k: str(v) for k, v in vars(a).items()}}, ck / name)
         if a.s3_prefix:
             import boto3
             boto3.client("s3").upload_file(str(ck / name), "xray-hands", f"{a.s3_prefix}/{run}/{name}")
 
-    best, step, t0, seen = -1.0, 0, time.time(), 0
+    step, t0, seen = step0, time.time(), 0
     model.train()
     it = iter(dl)
     res = {}
@@ -246,12 +272,12 @@ def main():
             print(f"step {step}: loss {loss.item():.3f} | val modal {res['modal_iou/mean']:.3f} hidden {res['hidden_iou/hand']:.3f}/"
                   f"{res['hidden_iou/obj']:.3f} occ10 {res['hidden_iou_occ10/mean']:.3f} 10-60 {res['hidden_iou_10to60/mean']:.3f} | "
                   f"train-val gap hidden {gap['gap/hidden_iou/mean']:+.3f}  {time.time() - t0:.0f}s", flush=True)
-            save("last.pt", res)
             if not full and res["hidden_iou_occ10/mean"] > best:
                 best = res["hidden_iou_occ10/mean"]
                 save("best.pt", res)
                 wandb.run.summary["best/hidden_iou_occ10_mean"] = best
                 wandb.run.summary["best/step"] = step
+            save("last.pt", res)
     (ck / "final_metrics.json").write_text(json.dumps(res, indent=1))
     if a.s3_prefix:
         import boto3
