@@ -6,7 +6,11 @@ input/output layers included). Also reports peak memory of one forward+backward 
 """
 import argparse
 import json
+import os
 import sys
+
+# the fp32 merge check runs without autocast, which flash_attn does not support
+os.environ["ATTN_BACKEND"] = os.environ["SPARSE_ATTN_BACKEND"] = "sdpa"
 from pathlib import Path
 
 import torch
@@ -82,16 +86,21 @@ def main():
         base_nograd = all(p.grad is None for n, p in model.named_parameters() if not p.requires_grad)
         peak = torch.cuda.max_memory_allocated() / 2 ** 30
         model.eval()
+        # merge exactness in fp32 (under bf16 autocast the rounding of W + BA can swallow a small update, which is
+        # why eval_b0.py keeps LoRA unmerged on the bf16 pipeline models)
+        with torch.no_grad():
+            y2f = feats(model(x, t, cond)).float()
         lora.merge(model)
-        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+        with torch.no_grad():
             y3 = feats(model(x, t, cond)).float()
+        y2 = y2f
         rel = lambda a_, b_: float((a_ - b_).norm() / b_.norm())  # noqa: E731
         res[stage] = {"lora_layers": len(names), "trainable": trn, "total": tot,
                       "zero_init_rel_diff": rel(y1, y0), "perturbed_rel_diff": rel(y2, y0),
-                      "merged_vs_lora_rel_diff": rel(y3, y2), "lora_grads": grads_ok, "base_frozen": base_nograd,
+                      "merged_vs_lora_rel_diff_fp32": rel(y3, y2), "lora_grads": grads_ok, "base_frozen": base_nograd,
                       "peak_mem_fwd_bwd_GiB_B2": peak}
         res[stage]["pass"] = (res[stage]["zero_init_rel_diff"] < 1e-6 and res[stage]["perturbed_rel_diff"] > 1e-4
-                              and res[stage]["merged_vs_lora_rel_diff"] < 2e-2 and grads_ok and base_nograd)
+                              and res[stage]["merged_vs_lora_rel_diff_fp32"] < 1e-3 and grads_ok and base_nograd)
         print(stage, json.dumps(res[stage], indent=1), flush=True)
         del model
         torch.cuda.empty_cache()

@@ -121,9 +121,9 @@ def build_pipeline(a):
             sd = torch.load(path, map_location="cuda")
             m = pipe.models[key]
             lora.inject(m, a.rank, a.alpha)
-            lora.load_lora(m, sd)
-            lora.merge(m)
-            print(f"LoRA merged into {key} from {path}", flush=True)
+            lora.load_lora(m, sd)  # kept unmerged: the pipeline models are bf16 and W + BA would round away
+            m.to("cuda")
+            print(f"LoRA loaded (unmerged) into {key} from {path}", flush=True)
     return pipe
 
 
