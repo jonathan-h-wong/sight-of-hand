@@ -6,9 +6,22 @@ cd $PX
 nvidia-smi
 [ -z "${SKIP_P5:-}" ] && { python3 /root/code/scripts/b0/p5_lora_check.py --out $OUT/p5 || echo "P5 FAILED (continuing with encode)"; }
 # the container's CPU quota, not the host's core count (nproc), sizes the pool
-Q=$(awk '{ if ($1 != "max") printf "%d", $1 / $2 }' /sys/fs/cgroup/cpu.max 2>/dev/null)
-[ -z "$Q" ] && Q=$(python3 -c "import os;print(len(os.sched_getaffinity(0)))")
-echo "cpu quota: $Q (nproc $(nproc)); cpu.max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null)"
+Q=$(python3 - <<'P' || true
+import os
+q = None
+try:  # cgroup v2
+    a, b = open("/sys/fs/cgroup/cpu.max").read().split()
+    q = None if a == "max" else int(a) // int(b)
+except Exception:
+    try:  # cgroup v1
+        a = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read()); b = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+        q = a // b if a > 0 else None
+    except Exception:
+        pass
+print(q or len(os.sched_getaffinity(0)))
+P
+)
+echo "cpu quota: $Q (nproc $(nproc))"
 W=${WORKERS:-$(( Q > 4 ? Q - 2 : 2 ))}
 for split in ${SPLITS:-val train}; do
   extra=""; [ $split = val ] && extra="--roundtrip 64 --overlays 16"
