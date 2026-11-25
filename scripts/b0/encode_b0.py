@@ -216,7 +216,8 @@ def main():
     print(json.dumps(fstats), flush=True)
     rows = keep.set_index("key")
     from multiprocessing import get_context
-    pool = get_context("fork").Pool(a.workers, initializer=_winit, initargs=(a.data, res_list, str(rc)))
+    # spawn, not fork: the parent has already imported torch / the CUDA extensions, and forked children can deadlock
+    pool = get_context("spawn").Pool(a.workers, initializer=_winit, initargs=(a.data, res_list, str(rc)))
     enc = models.from_pretrained(SHAPE_ENC).eval().cuda()
     ss_enc = models.from_pretrained(SS_ENC).eval().cuda()
     dec = models.from_pretrained(SHAPE_DEC).eval().cuda() if a.roundtrip else None
@@ -243,6 +244,7 @@ def main():
                     k, ext = m.name.rsplit(".", 1)
                     if k in rows.index:
                         mem.setdefault(k, {})[ext] = tf.extractfile(m).read()
+            print(f"shard {sh}: {len(mem)} samples queued, {time.time() - t0:.0f}s", flush=True)
             for key, f in mem.items():
                 yield key, f, rows.loc[key].to_dict()
 
@@ -327,7 +329,7 @@ def main():
             print(json.dumps({k: v for k, v in r_row.items() if "f@2" in k or "chamfer" in k or k == "p2_iou"}),
                   flush=True)
         n += 1
-        if n % 500 == 0:
+        if n % 100 == 0 or n in (1, 10):
             print(f"{n} samples, {time.time() - t0:.0f}s", flush=True)
     pool.close()
     saver.shutdown(wait=True)
