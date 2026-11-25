@@ -4,6 +4,7 @@ E=s3://xray-hands/train/b0_dexycb_s0_v1/encoded
 mkdir -p /workspace/b0 /workspace/lora && aws s3 cp --quiet $E/val.tar - | tar -xf - -C /workspace/b0
 aws s3 cp --quiet s3://xray-hands/masks/amodal_v1/dexycb/index.parquet /workspace/amodal_index.parquet
 pip install -q git+https://github.com/microsoft/MoGe.git
+pip install -q "huggingface_hub>=0.34,<1.0"  # MoGe pulls a hub version that transformers 4.57 rejects
 L=""
 for v in SS 512 1024; do
   n=LORA_$v; u=${!n:-}
