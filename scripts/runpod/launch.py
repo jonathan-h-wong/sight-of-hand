@@ -57,6 +57,8 @@ def main():
     ap.add_argument("--cloud", default="ALL", help="SECURE, COMMUNITY or ALL")
     ap.add_argument("--cpu-instance", default="cpu3g-16-64")
     ap.add_argument("--disk", type=int, default=100, help="container disk GB")
+    ap.add_argument("--min-vcpu", type=int, default=8)
+    ap.add_argument("--min-mem", type=int, default=60)
     ap.add_argument("--env", action="append", default=[], help="KEY=VALUE, repeatable")
     ap.add_argument("--pod-id")
     a = ap.parse_args()
@@ -82,7 +84,7 @@ def main():
         print(json.dumps(d, indent=1))
     else:
         inp = {"cloudType": a.cloud, "gpuCount": a.gpu_count, "gpuTypeId": a.gpu, "containerDiskInGb": a.disk,
-               "volumeInGb": 0, "minVcpuCount": 8, "minMemoryInGb": 60,
+               "volumeInGb": 0, "minVcpuCount": a.min_vcpu, "minMemoryInGb": a.min_mem,
                "imageName": a.image or "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04", "name": a.name,
                "dockerArgs": start_cmd(a.bootstrap, "apt-get -qq update >/dev/null && apt-get -qq install -y "
                                                     "python3-pip curl git >/dev/null && "),

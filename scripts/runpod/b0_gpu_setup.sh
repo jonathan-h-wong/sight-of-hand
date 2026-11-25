@@ -2,12 +2,14 @@
 # Pixal3D training environment on a RunPod GPU pod (image nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04, Python 3.10):
 # torch 2.6.0 + cu124, the prebuilt natten 0.21.0 wheel (NAF, stage 2), and TRELLIS.2's CUDA extensions (FlexGEMM,
 # CuMesh, o-voxel, nvdiffrast) compiled for this GPU's arch. Compiled wheels are cached at
-# s3://xray-hands/work/b0/wheels/sm<arch>/ so later pods skip the build. Sourced by b0_gpu_bootstrap.sh.
+# s3://xray-hands/work/b0/wheels/sm80_90/ so later pods skip the build. Sourced by b0_gpu_bootstrap.sh.
 # Run as a subprocess; it writes /root/b0env.sh (PX, EVAL, ATTN_BACKEND, ...) for the caller to source.
 set -e
 WH=s3://xray-hands/work/b0/wheels
-ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1)
-export TORCH_CUDA_ARCH_LIST=$ARCH MAX_JOBS=$(( $(nproc) > 32 ? 32 : $(nproc) ))
+# One wheel set for A100 (8.0) and H100/H200 (9.0). MAX_JOBS is kept low: 32 parallel nvcc jobs got the container
+# OOM-killed on the first attempt (the pod died silently mid-compile).
+ARCH=80_90
+export TORCH_CUDA_ARCH_LIST="8.0;9.0" MAX_JOBS=${MAX_JOBS:-6}
 apt-get -qq install -y git libgl1 libglib2.0-0 unzip > /dev/null 2>&1 || true
 python3 -m pip install -q --upgrade pip
 pip install -q torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124

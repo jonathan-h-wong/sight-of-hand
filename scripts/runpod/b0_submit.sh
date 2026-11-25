@@ -17,4 +17,4 @@ aws s3 cp --quiet scripts/runpod/b0_gpu_bootstrap.sh $J/bootstrap.sh
 aws s3 cp --quiet "$JS" $J/job.sh
 aws s3 rm --quiet --recursive $J/status || true
 python3 scripts/runpod/launch.py gpu --name "b0-$JOB" --gpu "$GPU" --disk $DISK --bootstrap $J/bootstrap.sh \
-  --env JOB=$JOB --env DEADLINE_S=$DL --cloud $CLOUD "${EXTRA[@]}"
+  --env JOB=$JOB --env DEADLINE_S=$DL --cloud $CLOUD --min-vcpu ${MIN_VCPU:-8} --min-mem ${MIN_MEM:-60} "${EXTRA[@]}"
