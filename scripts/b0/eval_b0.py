@@ -101,7 +101,24 @@ def padded_image(f, row, matte):
     return Image.fromarray(im), lm
 
 
+class _NoRembg:
+    """Stand-in for BiRefNet (briaai/RMBG-2.0 is gated for us): B0 never calls preprocess_image; mattes are the GT
+    modal mask (oracle) or none (raw)."""
+    def __init__(self, *a, **k):
+        pass
+
+    def to(self, *a, **k):
+        return self
+
+    cuda = cpu = to
+
+    def __call__(self, *a, **k):
+        raise RuntimeError("background removal is not used in B0 evaluation")
+
+
 def build_pipeline(a):
+    import pixal3d.pipelines.rembg as rembg
+    rembg.BiRefNet = _NoRembg
     import inference as inf  # Pixal3D/inference.py
     pipe = inf.Pixal3DImageTo3DPipeline.from_pretrained("TencentARC/Pixal3D")
     pipe.image_cond_model_ss = inf.build_image_cond_model(inf.IMAGE_COND_CONFIGS["ss"])
