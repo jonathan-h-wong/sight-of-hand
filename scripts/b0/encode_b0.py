@@ -164,6 +164,7 @@ def prep(job):
     import torch
     import o_voxel
     key, f, row = job
+    t_start = time.time()
     try:
         z = np.load(io.BytesIO(f["npz"]))
         V, F, part, hand, obj = _W["meshes"].soup(z)
@@ -179,8 +180,14 @@ def prep(job):
             "camera_angle_x": cax, "mesh_scale": 1.0 / L,
             "frames": [{"file_path": "view00.png", "camera_angle_x": cax,
                         "transform_matrix": G.front_transform_matrix(G.D_N)}]}))
-        grids = {r: tuple(t.numpy() for t in dual_grid(o_voxel, torch, g, F, r)) for r in _W["res"]}
-        return key, {"grids": grids, "V": V, "g": g, "hand": hand, "obj": obj, "K": z["K"]}, None
+        tm, grids = {"prep": time.time() - t_start}, {}
+        for r in _W["res"]:
+            t1 = time.time()
+            grids[r] = tuple(t.numpy() for t in dual_grid(o_voxel, torch, g, F, r))
+            tm[f"dg{r}"] = time.time() - t1
+        tm["n_faces"] = int(len(F))
+        tm["n_vox_1024"] = int(len(grids[max(grids)][0]))
+        return key, {"grids": grids, "V": V, "g": g, "hand": hand, "obj": obj, "K": z["K"], "tm": tm}, None
     except Exception as e:  # recorded, not fatal
         return key, None, repr(e)[:300]
 
@@ -261,6 +268,7 @@ def main():
         row = rows.loc[key]
         d, L = float(row.d), float(row.L_n)
         g = P["g"]
+        t_gpu = time.time()
         scale = {"total_scale": 1.0 / L, "L_n": L, "d": d, "D_n": G.D_N, "camera_angle_x": float(row.camera_angle_x)}
         lat = {}
         for r in res_list:
@@ -334,6 +342,9 @@ def main():
             print(json.dumps({k: v for k, v in r_row.items() if "f@2" in k or "chamfer" in k or k == "p2_iou"}),
                   flush=True)
         n += 1
+        if n <= 20:
+            print(json.dumps({"timing": key, **{k: round(v, 3) if isinstance(v, float) else v for k, v in P["tm"].items()},
+                              "gpu_s": round(time.time() - t_gpu, 3)}), flush=True)
         if n % 100 == 0 or n in (1, 10):
             print(f"{n} samples, {time.time() - t0:.0f}s", flush=True)
     pool.close()
