@@ -11,7 +11,7 @@ WH=s3://xray-hands/work/b0/wheels
 ARCH=80_90
 export TORCH_CUDA_ARCH_LIST="8.0;9.0" MAX_JOBS=${MAX_JOBS:-6}
 apt-get -qq install -y git libgl1 libglib2.0-0 unzip > /dev/null 2>&1 || true
-python3 -m pip install -q --upgrade pip
+python3 -m pip install -q --upgrade pip "setuptools>=69" wheel  # old setuptools names no-isolation builds UNKNOWN-0.0.0
 pip install -q torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 pip install -q "https://github.com/LDYang694/Storages/releases/download/20260430/natten-0.21.0+torch2.6cu124-cp310-cp310-linux_x86_64.whl"
 pip install -q ninja trimesh scipy rtree easydict pandas pyarrow pyyaml boto3 huggingface_hub hf_transfer zstandard \
@@ -30,6 +30,7 @@ else
   for p in FlexGEMM CuMesh nvdiffrast TRELLIS.2/o-voxel; do
     pip wheel -q --no-build-isolation --no-deps -w /root/wheels ./$p
   done
+  ls /root/wheels | grep -q UNKNOWN && { echo "a wheel lost its metadata"; ls /root/wheels; exit 1; }
   aws s3 sync --quiet /root/wheels $WH/sm$ARCH && touch /tmp/DONE && aws s3 cp --quiet /tmp/DONE $WH/sm$ARCH/DONE
 fi
 pip install -q --no-deps /root/wheels/*.whl
@@ -45,4 +46,4 @@ source /root/b0env.sh
 D=/workspace/data; mkdir -p $D/dexycb $D/mano
 [ -d $D/mano/mano_v1_2 ] || { aws s3 cp --quiet s3://xray-hands/raw/mano/mano_v1_2.zip $D/mano/ && unzip -q -o $D/mano/mano_v1_2.zip -d $D/mano; }
 [ -d $D/dexycb/models ] || aws s3 cp --quiet s3://xray-hands/raw/dexycb/models.tar.gz - | tar -xzf - -C $D/dexycb --wildcards '*textured_simple.obj'
-cd $PX && python3 -c "import torch, o_voxel, flex_gemm, cumesh, natten; import pixal3d.models; print('env ok', torch.__version__, torch.cuda.get_device_name())"
+cd $PX && python3 -c "import torch, nvdiffrast.torch, o_voxel, flex_gemm, cumesh, natten; import pixal3d.models; print('env ok', torch.__version__, torch.cuda.get_device_name())"
