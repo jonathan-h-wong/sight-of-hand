@@ -50,6 +50,25 @@ SS_NAME = "ss_enc_conv3d_16l8_fp16_64_view"
 TAUS_MM = (1.0, 2.0, 5.0)
 
 
+def s3_client():
+    import boto3
+    from botocore.config import Config
+    return boto3.client("s3", config=Config(retries={"max_attempts": 10, "mode": "adaptive"},
+                                            read_timeout=300, connect_timeout=60))
+
+
+def s3_get(s3, key, tries=8):
+    """Whole-object read with retries: one dropped read must not kill a multi-hour encode."""
+    for t in range(tries):
+        try:
+            return s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+        except Exception as e:
+            if t == tries - 1:
+                raise
+            print(f"[retry {t + 1}] {key}: {e}", flush=True)
+            time.sleep(min(60, 5 * 2 ** t))
+
+
 def apply_filters(idx, split, a):
     tr = idx[idx.split == "train"]
     d_min = a.d_min if a.d_min is not None else float(np.percentile(tr.d, 0.5))
@@ -215,13 +234,13 @@ def main():
     import pixal3d.modules.sparse as sp
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import project_points_to_image_batch
     torch.set_grad_enabled(False)
-    s3 = boto3.client("s3")
+    s3 = s3_client()
     res_list = [int(r) for r in a.res.split(",")]
     out = Path(a.out) / a.split
     rc = out / "renders_cond"
     rc.mkdir(parents=True, exist_ok=True)
 
-    idx = pd.read_parquet(io.BytesIO(s3.get_object(Bucket=BUCKET, Key=f"{a.prefix}/index.parquet")["Body"].read()))
+    idx = pd.read_parquet(io.BytesIO(s3_get(s3, f"{a.prefix}/index.parquet")))
     keep, fstats = apply_filters(idx, a.split, a)
     if a.limit:
         keep = keep.sample(min(a.limit, len(keep)), random_state=0) if a.split != "train" else keep.head(a.limit)
@@ -249,7 +268,7 @@ def main():
 
     def jobs():
         for sh in sorted(rows.shard.unique()):
-            body = io.BytesIO(s3.get_object(Bucket=BUCKET, Key=f"{a.prefix}/shards/{sh}")["Body"].read())
+            body = io.BytesIO(s3_get(s3, f"{a.prefix}/shards/{sh}"))
             mem = {}
             with tarfile.open(fileobj=body) as tf:
                 for m in tf:
