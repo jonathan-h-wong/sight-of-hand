@@ -3,6 +3,7 @@
 set -ex
 E=s3://xray-hands/train/b0_dexycb_s0_v1/encoded
 J=s3://xray-hands/work/b0/jobs/$JOB
+until aws s3 ls $E/encode_summary_train.json > /dev/null; do sleep 30; done  # written after train.tar
 mkdir -p /workspace/b0 && aws s3 cp --quiet $E/train.tar - | tar -xf - -C /workspace/b0
 aws s3 sync --quiet $J/out/$STAGE $OUT/$STAGE || true
 cd $PX
