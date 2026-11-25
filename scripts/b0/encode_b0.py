@@ -145,6 +145,41 @@ def splat(uv, S, r=1):
     return m
 
 
+_W = {}
+
+
+def _winit(data, res_list, rc):
+    import torch
+    torch.set_num_threads(1)
+    _W.update(meshes=Meshes(data), res=res_list, rc=Path(rc))
+
+
+def prep(job):
+    """CPU side of one sample (pool worker): soup -> grid -> dual grids; RGBA image + transforms.json on disk."""
+    import torch
+    import o_voxel
+    key, f, row = job
+    try:
+        z = np.load(io.BytesIO(f["npz"]))
+        V, F, part, hand, obj = _W["meshes"].soup(z)
+        d, L = float(row["d"]), float(row["L_n"])
+        g = G.cam_to_grid(V, d, L)
+        if not G.contained(g, 1.0 / 1024):
+            return key, None, f"outside cube {np.abs(g).max():.4f}"
+        rc = _W["rc"] / key
+        rc.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(rgba(f["jpg"], f["png"], pd.Series(row)), "RGBA").save(rc / "view00.png")
+        cax = float(row["camera_angle_x"])
+        (rc / "transforms.json").write_text(json.dumps({
+            "camera_angle_x": cax, "mesh_scale": 1.0 / L,
+            "frames": [{"file_path": "view00.png", "camera_angle_x": cax,
+                        "transform_matrix": G.front_transform_matrix(G.D_N)}]}))
+        grids = {r: tuple(t.numpy() for t in dual_grid(o_voxel, torch, g, F, r)) for r in _W["res"]}
+        return key, {"grids": grids, "V": V, "g": g, "hand": hand, "obj": obj, "K": z["K"]}, None
+    except Exception as e:  # recorded, not fatal
+        return key, None, repr(e)[:300]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--split", default="train")
@@ -180,13 +215,14 @@ def main():
         keep = keep.sample(min(a.limit, len(keep)), random_state=0) if a.split != "train" else keep.head(a.limit)
     print(json.dumps(fstats), flush=True)
     rows = keep.set_index("key")
-    meshes = Meshes(a.data)
+    from multiprocessing import get_context
+    pool = get_context("fork").Pool(a.workers, initializer=_winit, initargs=(a.data, res_list, str(rc)))
     enc = models.from_pretrained(SHAPE_ENC).eval().cuda()
     ss_enc = models.from_pretrained(SS_ENC).eval().cuda()
     dec = models.from_pretrained(SHAPE_DEC).eval().cuda() if a.roundtrip else None
     rt_keys = set(keep.key.sample(min(a.roundtrip, len(keep)), random_state=1)) if a.roundtrip else set()
     ov_keys = set(list(rt_keys)[:a.overlays])
-    rt_rows, recs, t0, n = [], {"rc": [], "ss": [], **{r: [] for r in res_list}}, time.time(), 0
+    rt_rows, recs, t0, n, errs = [], {"rc": [], "ss": [], **{r: [] for r in res_list}}, time.time(), 0, []
     (out / "p2").mkdir(exist_ok=True)
     saver = ThreadPoolExecutor(8)
 
@@ -198,106 +234,102 @@ def main():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(obj))
 
-    shards = sorted(rows.shard.unique())
-    for sh in shards:
-        body = io.BytesIO(s3.get_object(Bucket=BUCKET, Key=f"{a.prefix}/shards/{sh}")["Body"].read())
-        mem = {}
-        with tarfile.open(fileobj=body) as tf:
-            for m in tf:
-                k, ext = m.name.rsplit(".", 1)
-                if k in rows.index:
-                    mem.setdefault(k, {})[ext] = tf.extractfile(m).read()
-        for key, f in mem.items():
-            row = rows.loc[key]
-            z = np.load(io.BytesIO(f["npz"]))
-            V, F, part, (hv, hf), (ov, of) = meshes.soup(z)
-            d, L = float(row.d), float(row.L_n)
-            g = G.cam_to_grid(V, d, L)
-            if not G.contained(g, 1.0 / 1024):
-                print(f"[skip] {key}: outside cube {np.abs(g).max():.4f}")
-                continue
-            scale = {"total_scale": 1.0 / L, "L_n": L, "d": d, "D_n": G.D_N, "camera_angle_x": float(row.camera_angle_x)}
-            # image + camera
-            im = rgba(f["jpg"], f["png"], row)
-            saver.submit(lambda p=rc / key / "view00.png", im=im: (p.parent.mkdir(parents=True, exist_ok=True),
-                                                                  Image.fromarray(im, "RGBA").save(p)))
-            save_json(rc / key / "transforms.json", {
-                "camera_angle_x": float(row.camera_angle_x), "mesh_scale": 1.0 / L,
-                "frames": [{"file_path": "view00.png", "camera_angle_x": float(row.camera_angle_x),
-                            "transform_matrix": G.front_transform_matrix(G.D_N)}]})
-            recs["rc"].append({"sha256": key, "cond_rendered": True})
-            lat = {}
+    def jobs():
+        for sh in sorted(rows.shard.unique()):
+            body = io.BytesIO(s3.get_object(Bucket=BUCKET, Key=f"{a.prefix}/shards/{sh}")["Body"].read())
+            mem = {}
+            with tarfile.open(fileobj=body) as tf:
+                for m in tf:
+                    k, ext = m.name.rsplit(".", 1)
+                    if k in rows.index:
+                        mem.setdefault(k, {})[ext] = tf.extractfile(m).read()
+            for key, f in mem.items():
+                yield key, f, rows.loc[key].to_dict()
+
+    for key, P, err in pool.imap_unordered(prep, jobs(), chunksize=4):
+        if P is None:
+            errs.append((key, err))
+            print(f"[skip] {key}: {err}", flush=True)
+            continue
+        row = rows.loc[key]
+        d, L = float(row.d), float(row.L_n)
+        g = P["g"]
+        scale = {"total_scale": 1.0 / L, "L_n": L, "d": d, "D_n": G.D_N, "camera_angle_x": float(row.camera_angle_x)}
+        lat = {}
+        for r in res_list:
+            vi, dv, it = (torch.from_numpy(x) for x in P["grids"][r])
+            vert, inter = to_sparse(sp, torch, vi, dv, it)
+            zz = enc(vert, inter)
+            if not torch.isfinite(zz.feats).all():
+                errs.append((key, f"non-finite latent at {r}"))
+                lat = None
+                break
+            lat[r] = (zz, len(vi))
+        if lat is None:
+            continue
+        for r, (zz, nv) in lat.items():
+            pack = {"feats": zz.feats.float().cpu().numpy(), "coords": zz.coords[:, 1:].cpu().numpy().astype(np.uint8)}
+            dd = out / "shape_latents" / SHAPE_NAME.format(res=r) / key
+            saver.submit(save_npz, dd / "view00.npz", **pack)
+            save_json(dd / "view00_scale.json", scale)
+            recs[r].append({"sha256": key, "shape_latent_view00_encoded": True,
+                            "shape_latent_tokens": int(len(pack["coords"])), "dual_grid_voxels": int(nv)})
+        recs["rc"].append({"sha256": key, "cond_rendered": True})
+        # stage 1 target: the 1024 latent cells (64^3) -> ss VAE
+        if 1024 in lat:
+            c64 = lat[1024][0].coords[:, 1:].long()
+            ss = torch.zeros(1, 1, 64, 64, 64, device="cuda")
+            ss[0, 0, c64[:, 0], c64[:, 1], c64[:, 2]] = 1
+            zs = ss_enc(ss, sample_posterior=False)
+            dd = out / "ss_latents" / SS_NAME / key
+            saver.submit(save_npz, dd / "view00.npz", z=zs[0].float().cpu().numpy())
+            save_json(dd / "view00_scale.json", scale)
+            recs["ss"].append({"sha256": key, "ss_latent_view00_encoded": True, "ss_cells_64": int(len(c64))})
+        # P1 round trip / P2 alignment
+        if key in rt_keys:
+            (hv, hf), (ov, of) = P["hand"], P["obj"]
+            gt_h, _ = surface(hv, hf, 20000, 0)
+            gt_o, _ = surface(ov, of, 20000, 1)
+            r_row = {"key": key, "d": d, "L_n": L, "kind": row.kind, "grasp_obj": row.grasp_obj,
+                     "bbox_gt": [g.min(0).round(4).tolist(), g.max(0).round(4).tolist()]}
+            from scipy.spatial import cKDTree
             for r in res_list:
-                vi, dv, it = dual_grid(o_voxel, torch, g, F, r)
-                vert, inter = to_sparse(sp, torch, vi, dv, it)
-                zz = enc(vert, inter)
-                if not torch.isfinite(zz.feats).all():
-                    print(f"[skip] {key}: non-finite latent at {r}")
-                    lat = None
-                    break
-                lat[r] = zz
-                pack = {"feats": zz.feats.float().cpu().numpy(), "coords": zz.coords[:, 1:].cpu().numpy().astype(np.uint8)}
-                dd = out / "shape_latents" / SHAPE_NAME.format(res=r) / key
-                saver.submit(save_npz, dd / "view00.npz", **pack)
-                save_json(dd / "view00_scale.json", scale)
-                recs[r].append({"sha256": key, "shape_latent_view00_encoded": True,
-                                "shape_latent_tokens": int(len(pack["coords"])), "dual_grid_voxels": int(len(vi))})
-            if lat is None:
-                continue
-            # stage 1 target: the 1024 latent cells (64^3) -> ss VAE
-            c64 = lat[1024].coords[:, 1:].long() if 1024 in lat else None
-            if c64 is not None:
-                ss = torch.zeros(1, 1, 64, 64, 64, device="cuda")
-                ss[0, 0, c64[:, 0], c64[:, 1], c64[:, 2]] = 1
-                zs = ss_enc(ss, sample_posterior=False)
-                dd = out / "ss_latents" / SS_NAME / key
-                saver.submit(save_npz, dd / "view00.npz", z=zs[0].float().cpu().numpy())
-                save_json(dd / "view00_scale.json", scale)
-                recs["ss"].append({"sha256": key, "ss_latent_view00_encoded": True, "ss_cells_64": int(len(c64))})
-            # P1 round trip / P2 alignment
-            if key in rt_keys:
-                gt_h, _ = surface(hv, hf, 20000, 0)
-                gt_o, _ = surface(ov, of, 20000, 1)
-                r_row = {"key": key, "d": d, "L_n": L, "kind": row.kind, "grasp_obj": row.grasp_obj}
-                for r in res_list:
-                    dec.set_resolution(r)
-                    mo = dec(lat[r])
-                    mo = mo[0] if isinstance(mo, (list, tuple)) else mo
-                    mo = mo[0] if isinstance(mo, (list, tuple)) else mo
-                    dv_ = mo.vertices.float().cpu().numpy()
-                    df_ = mo.faces.long().cpu().numpy()
-                    r_row[f"bbox_dec_{r}"] = [dv_.min(0).round(4).tolist(), dv_.max(0).round(4).tolist()]
-                    r_row[f"bbox_gt"] = [g.min(0).round(4).tolist(), g.max(0).round(4).tolist()]
-                    pc, _ = surface(G.grid_to_cam(dv_, d, L), df_, 40000, 2)
-                    # split decoded points by the nearer GT part
-                    from scipy.spatial import cKDTree
-                    dh, do = cKDTree(gt_h).query(pc)[0], cKDTree(gt_o).query(pc)[0]
-                    ph, po = pc[dh <= do], pc[dh > do]
-                    for nm, pr, gt in (("soup", pc, np.r_[gt_h, gt_o]), ("hand", ph, gt_h), ("obj", po, gt_o)):
-                        if len(pr):
-                            for kk, vv in fscores(pr * 1000, gt * 1000).items():
-                                r_row[f"{nm}_{kk}_{r}"] = vv
-                    r_row[f"tokens_{r}"] = int(lat[r].feats.shape[0])
-                    if key in ov_keys and r == max(res_list):
-                        # P2: decoded vertices through ProjGrid's fixed front camera vs GT soup through the real K
-                        Sx = int(row.S)
-                        w = torch.tensor(dv_ @ G.R_PROJ.T * L, dtype=torch.float32)[None]
-                        T = torch.tensor(G.front_transform_matrix(G.D_N))[None]
-                        uv = project_points_to_image_batch(w, T, torch.tensor([float(row.camera_angle_x)]), Sx)[0][0].numpy()
-                        K = z["K"]
-                        uv_gt = (V @ K.T)[:, :2] / V[:, 2:3] + [row.pad_x, row.pad_y]
-                        sd, sg = splat(uv, Sx, 2), splat(uv_gt, Sx, 2)
-                        r_row["p2_iou"] = float((sd & sg).sum() / max((sd | sg).sum(), 1))
-                        vis = im[..., :3].copy()
-                        vis[sg] = (0.5 * vis[sg] + [0, 120, 0]).astype(np.uint8)
-                        vis[sd] = (0.5 * vis[sd] + [120, 0, 120]).astype(np.uint8)
-                        Image.fromarray(vis).save(out / "p2" / f"{key}.jpg", quality=90)
-                rt_rows.append(r_row)
-                print(json.dumps({k: v for k, v in r_row.items() if "f@2" in k or "chamfer" in k or k == "p2_iou"}),
-                      flush=True)
-            n += 1
-            if n % 200 == 0:
-                print(f"{n} samples, {time.time() - t0:.0f}s", flush=True)
+                dec.set_resolution(r)
+                mo = dec(lat[r][0])
+                mo = mo[0] if isinstance(mo, (list, tuple)) else mo
+                mo = mo[0] if isinstance(mo, (list, tuple)) else mo
+                dv_ = mo.vertices.float().cpu().numpy()
+                df_ = mo.faces.long().cpu().numpy()
+                r_row[f"bbox_dec_{r}"] = [dv_.min(0).round(4).tolist(), dv_.max(0).round(4).tolist()]
+                pc, _ = surface(G.grid_to_cam(dv_, d, L), df_, 40000, 2)
+                dh, do = cKDTree(gt_h).query(pc)[0], cKDTree(gt_o).query(pc)[0]
+                ph, po = pc[dh <= do], pc[dh > do]
+                for nm, pr, gt in (("soup", pc, np.r_[gt_h, gt_o]), ("hand", ph, gt_h), ("obj", po, gt_o)):
+                    if len(pr):
+                        for kk, vv in fscores(pr * 1000, gt * 1000).items():
+                            r_row[f"{nm}_{kk}_{r}"] = vv
+                r_row[f"tokens_{r}"] = int(lat[r][0].feats.shape[0])
+                if key in ov_keys and r == max(res_list):
+                    # P2: decoded vertices through ProjGrid's fixed front camera vs GT soup through the real K
+                    Sx = int(row.S)
+                    w = torch.tensor(dv_ @ G.R_PROJ.T * L, dtype=torch.float32)[None]
+                    T = torch.tensor(G.front_transform_matrix(G.D_N))[None]
+                    uv = project_points_to_image_batch(w, T, torch.tensor([float(row.camera_angle_x)]), Sx)[0][0].numpy()
+                    V, K = P["V"], P["K"]
+                    uv_gt = (V @ K.T)[:, :2] / V[:, 2:3] + [row.pad_x, row.pad_y]
+                    sd, sg = splat(uv, Sx, 2), splat(uv_gt, Sx, 2)
+                    r_row["p2_iou"] = float((sd & sg).sum() / max((sd | sg).sum(), 1))
+                    vis = np.asarray(Image.open(rc / key / "view00.png").convert("RGB")).copy()
+                    vis[sg] = (0.5 * vis[sg] + [0, 120, 0]).astype(np.uint8)
+                    vis[sd] = (0.5 * vis[sd] + [120, 0, 120]).astype(np.uint8)
+                    Image.fromarray(vis).save(out / "p2" / f"{key}.jpg", quality=90)
+            rt_rows.append(r_row)
+            print(json.dumps({k: v for k, v in r_row.items() if "f@2" in k or "chamfer" in k or k == "p2_iou"}),
+                  flush=True)
+        n += 1
+        if n % 500 == 0:
+            print(f"{n} samples, {time.time() - t0:.0f}s", flush=True)
+    pool.close()
     saver.shutdown(wait=True)
     # metadata.csv per sub-root
     pd.DataFrame(recs["rc"]).to_csv(rc / "metadata.csv", index=False)
@@ -306,7 +338,7 @@ def main():
             pd.DataFrame(recs[r]).to_csv(out / "shape_latents" / SHAPE_NAME.format(res=r) / "metadata.csv", index=False)
     if recs["ss"]:
         pd.DataFrame(recs["ss"]).to_csv(out / "ss_latents" / SS_NAME / "metadata.csv", index=False)
-    summ = {"split": a.split, "filters": fstats, "encoded": n, "seconds": time.time() - t0}
+    summ = {"split": a.split, "filters": fstats, "encoded": n, "skipped": len(errs), "skip_examples": errs[:20], "seconds": time.time() - t0}
     for r in res_list:
         if recs[r]:
             t = pd.DataFrame(recs[r]).shape_latent_tokens

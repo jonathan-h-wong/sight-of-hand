@@ -178,8 +178,11 @@ def main():
     trainer = tcls({"denoiser": model}, ds, **copy.deepcopy(cfg["trainer"]["args"]), output_dir=a.out,
                    load_dir=a.out, step=step, wandb_run=wandb_run)
     if trainer.is_master and trainer.writer is None:
-        class _W:
+        class _W:  # stock run() closes a TensorBoard writer it never creates
             def close(self):
+                pass
+
+            def add_scalar(self, *a, **k):
                 pass
         trainer.writer = _W()
     trainer.run()
