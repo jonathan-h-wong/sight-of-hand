@@ -88,8 +88,12 @@ def main():
     ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
     cfg = ck["config"]
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    model = AmodalMaskNet(T=cfg["T"], rgb_skip=cfg["rgb_skip"]).to(dev).eval()
-    model.head.load_state_dict(ck["head"])
+    if cfg.get("version") == 2:  # v2 checkpoints (scripts/train_amodal_v2.py): forward returns a dict
+        from sight_of_hand.amodal_net.model_v2 import from_checkpoint
+        model = from_checkpoint(ck).to(dev).eval()
+    else:
+        model = AmodalMaskNet(T=cfg["T"], rgb_skip=cfg["rgb_skip"]).to(dev).eval()
+        model.head.load_state_dict(ck["head"])
     items = D.index_shards(sorted((a.data / "shards").glob("val_*.tar")))
     rng = random.Random(a.seed)
     picks = []
@@ -105,7 +109,8 @@ def main():
     with torch.no_grad():
         for part, name, i in picks:
             x, y, meta = ds[i]
-            p = torch.sigmoid(model(x[None].to(dev)))[0].float().cpu().numpy()
+            o = model(x[None].to(dev))
+            p = torch.sigmoid(o["logits"] if isinstance(o, dict) else o)[0].float().cpu().numpy()
             if p.shape[-1] != y.shape[-1]:
                 y = torch.nn.functional.interpolate(y[None], size=p.shape[-2:], mode="nearest")[0]
             yb = y.numpy() > 0.5

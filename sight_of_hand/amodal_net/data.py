@@ -44,8 +44,11 @@ def _read(path, rng):
 
 
 class AmodalShards(Dataset):
-    def __init__(self, items, train, out=OUT, seed=0):
-        self.items, self.train, self.out = items, train, out
+    """joints: optional {key: (valid, (21,2) image pixels)} from joints_2d.parquet; mapped through the stored context
+    crop and the sampled training box into output pixels (0..out), returned as meta["joints"], meta["jvalid"]."""
+
+    def __init__(self, items, train, out=OUT, seed=0, joints=None):
+        self.items, self.train, self.out, self.joints = items, train, out, joints
         self.rng = random.Random(seed)
 
     def __len__(self):
@@ -87,14 +90,31 @@ class AmodalShards(Dataset):
         y[0] = torch.maximum(y[0], y[2])  # modal subset of amodal (holds by construction; keeps resizing exact)
         y[1] = torch.maximum(y[1], y[3])
         m = it["meta"]
-        return x, y, {"hand_hidden_frac": m["hand_hidden_frac"], "obj_hidden_frac": m["obj_hidden_frac"], "idx": i}
+        meta = {"hand_hidden_frac": m["hand_hidden_frac"], "obj_hidden_frac": m["obj_hidden_frac"], "idx": i}
+        if self.joints is not None:
+            valid, j = self.joints.get(it["key"], (False, None))
+            if valid:
+                ctx = (np.asarray(j, np.float32) - [m["crop_x0"], m["crop_y0"]]) * (CTX / m["crop_side"])
+                meta["joints"] = torch.from_numpy((ctx - [x0, y0]) * (self.out / s)).float()
+            else:
+                meta["joints"] = torch.zeros(21, 2)
+            meta["jvalid"] = float(valid)
+        return x, y, meta
 
 
 def collate(batch):
     x = torch.stack([b[0] for b in batch])
     y = torch.stack([b[1] for b in batch])
-    meta = {k: torch.tensor([float(b[2][k]) for b in batch]) for k in batch[0][2]}
+    meta = {k: torch.stack([b[2][k] for b in batch]) if torch.is_tensor(batch[0][2][k])
+            else torch.tensor([float(b[2][k]) for b in batch]) for k in batch[0][2]}
     return x, y, meta
+
+
+def load_joints(path):
+    """joints_2d.parquet -> {key: (valid, (21,2) array)}."""
+    import pandas as pd
+    df = pd.read_parquet(path)
+    return {k: (bool(v), np.asarray(j, np.float32).reshape(21, 2)) for k, v, j in zip(df.key, df.valid, df.joints)}
 
 
 def local_shards(root, split):
