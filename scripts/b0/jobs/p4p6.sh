@@ -3,6 +3,7 @@ set -ex
 E=s3://xray-hands/train/b0_dexycb_s0_v1/encoded
 mkdir -p /workspace/b0 && aws s3 cp --quiet $E/val.tar - | tar -xf - -C /workspace/b0
 cd $PX
+python3 /root/code/scripts/b0/p5_lora_check.py --out $OUT/p5 || echo "P5 FAILED"
 ls /workspace/b0/val/ss_latents/*/ | head -3
 python3 - <<P
 import pandas as pd
