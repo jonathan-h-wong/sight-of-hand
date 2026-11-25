@@ -23,6 +23,11 @@ import io
 import json
 import os
 import sys
+
+# one BLAS/OpenMP thread per process: with ~250 pool workers each starting a thread per core, thread creation fails
+# (OpenBLAS blas_thread_init) and workers die or hang. Set before numpy is imported; spawned children inherit it.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_v] = "1"
 import tarfile
 import time
 from concurrent.futures import ThreadPoolExecutor
