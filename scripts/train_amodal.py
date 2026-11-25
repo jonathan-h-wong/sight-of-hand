@@ -99,6 +99,12 @@ def main():
                     collate_fn=D.collate, drop_last=True, pin_memory=True, persistent_workers=a.workers > 0)
     vdl = DataLoader(D.AmodalShards(val, False), batch_size=a.batch, shuffle=False, num_workers=a.workers,
                      collate_fn=D.collate, pin_memory=True)
+    # periodic val: a fixed sample spread evenly over all val sequences (the first N sorted items cover only a few
+    # sequences and over-stated object hidden IoU by ~0.06 in run T512_1124_2241)
+    n_sub = min(len(val), a.val_batches * a.batch) if a.val_batches else len(val)
+    sub = [val[i] for i in np.linspace(0, len(val) - 1, n_sub).astype(int)]
+    vdl_sub = DataLoader(D.AmodalShards(sub, False), batch_size=a.batch, shuffle=False, num_workers=a.workers,
+                         collate_fn=D.collate, pin_memory=True)
     vis = D.collate([D.AmodalShards(val, False)[i] for i in np.linspace(0, len(val) - 1, 8).astype(int)])
 
     model = AmodalMaskNet(T=a.T, rgb_skip=not a.no_rgb_skip).to(device)
@@ -149,7 +155,7 @@ def main():
                        "mem/max_gb": torch.cuda.max_memory_allocated() / 1e9}, step=step)
         if step % a.val_every == 0 or step == a.steps:
             full = step == a.steps
-            res = evaluate(model, vdl, device, 0 if full else a.val_batches)
+            res = evaluate(model, vdl if full else vdl_sub, device, 0)
             with torch.no_grad():
                 model.eval()
                 pv = torch.sigmoid(model(vis[0].to(device)))
