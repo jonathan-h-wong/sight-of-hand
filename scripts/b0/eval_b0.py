@@ -236,6 +236,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-meshes", type=int, default=12)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--shard", default="0/1", help="i/n: evaluate every n-th frame starting at i (split across pods)")
     a = ap.parse_args()
 
     import boto3
@@ -252,6 +253,8 @@ def main():
     keys = list(sets)
     if a.limit:
         keys = keys[:a.limit]
+    si, sn = map(int, a.shard.split("/"))
+    keys = keys[si::sn]
     print(f"eval set: {pd.Series(sets).value_counts().to_dict()}", flush=True)
     meshes = Meshes(a.data)
     pipe = build_pipeline(a)
