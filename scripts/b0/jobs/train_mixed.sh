@@ -1,12 +1,13 @@
 # Stage 2 (512) LoRA mixed training: same recipe as B0's train_shape512 (batch 16 split 2, LR 2e-4, 8K steps),
-# with --pred-coords from the gen_pred_* jobs. Env: GEN_JOBS (space-separated job names), PRED_FRAC, EXTRA, STEPS.
+# with --pred-coords from the gen_pred_* jobs. Env: GEN_JOBS (space-separated job names), PRED_FRAC, EXTRA, STEPS,
+# SMOKE=1 (use whatever predictions are uploaded so far, without waiting for the jobs to finish).
 set -ex
 E=s3://xray-hands/train/b0_dexycb_s0_v1/encoded
 W=s3://xray-hands/work/b0/jobs
 J=$W/$JOB
 mkdir -p /workspace/b0 /workspace/pred && aws s3 cp --quiet $E/train.tar - | tar -xf - -C /workspace/b0
 for g in $GEN_JOBS; do
-  until [ "$(aws s3 cp $W/$g/status/STATE - 2>/dev/null)" = "DONE" ]; do sleep 60; done
+  [ "${SMOKE:-0}" = 1 ] || until [ "$(aws s3 cp $W/$g/status/STATE - 2>/dev/null)" = "DONE" ]; do sleep 60; done
   aws s3 sync --quiet $W/$g/out/pred/coords /workspace/pred
 done
 ls /workspace/pred | wc -l
