@@ -58,7 +58,7 @@ def render_key(key, runs, rows, out):
     for r in runs:
         for p in (r / "meshes").glob(f"{key}__*.ply"):
             m = trimesh.load(p, process=False)
-            _, mode, row = p.stem.split("__")
+            mode, row = p.stem.split("__")[-2:]
             meshes[f"{mode}__{row}"] = (np.asarray(m.vertices), np.asarray(m.faces))
     cols = [c for c in COLS if c[0] in meshes]
     c0 = meshes["gt"][0].mean(0)
@@ -93,8 +93,8 @@ def render_key(key, runs, rows, out):
         row = k.split("__")[-1]
         if k.startswith("cascade") and row in occ:
             o = occ[row]
-            g = {tuple(x) for x in o["gt"]}
-            p = {tuple(x) for x in o["pred"]}
+            g = {tuple(x) for x in o["gt"].astype(int).tolist()}  # coords are stored as uint8
+            p = {tuple(x) for x in o["pred"].astype(int).tolist()}
             for s, c, lab in ((g & p, "0.6", "both"), (g - p, "tab:red", "GT only (missed)"),
                               (p - g, "tab:blue", "predicted only")):
                 if s:
