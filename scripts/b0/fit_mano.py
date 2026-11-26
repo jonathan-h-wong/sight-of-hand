@@ -5,7 +5,7 @@ For each frame with saved meshes (eval_b0 --save-every), targets:
   gt512       B0 stage 2 on GT voxels, predicted hand points
   cascade512  B0 cascade, predicted hand points
 Predicted hand points = predicted surface samples nearer the GT hand than the GT object (the oracle split the hand
-F-scores use; B0 has no label head). Each fit starts from 24 random orientations at the mean pose (no GT pose used).
+F-scores use; B0 has no label head). Each fit starts from 64 random orientations at the mean pose (rigid first, then pose) (no GT pose used).
 Per target: fit_to_target F@2/F@5 (does a MANO hand explain the prediction?), target_vs_gt and fit_vs_gt F@2/F@5
 (does the MANO projection keep, lose or improve accuracy?), MPJPE of the fit's 21 joints vs the GT hand's (mm).
 

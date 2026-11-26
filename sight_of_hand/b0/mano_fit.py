@@ -129,7 +129,8 @@ def _tdist(a, b, trunc):
     return d.clamp(max=trunc).mean(1)
 
 
-def fit(mano, target, n_starts=24, iters_a=120, iters_b=400, trunc=0.02, w_pose=1e-6, w_beta=1e-5, seed=0):
+def fit(mano, target, n_starts=64, iters_a=100, iters_b=400, trunc=0.02, w_pose=1e-6, w_beta=1e-5, seed=0, keep=8,
+        rigid=40, n_sub=300):
     """Fit MANO to target points (N,3) metres. Returns dict of numpy params, verts, joints and the final loss."""
     tgt = torch.tensor(target, dtype=torch.float32)
     rng = np.random.default_rng(seed)
@@ -138,7 +139,7 @@ def fit(mano, target, n_starts=24, iters_a=120, iters_b=400, trunc=0.02, w_pose=
     fidx = torch.from_numpy(rng.integers(0, nf, 2000))
     b = rng.dirichlet([1, 1, 1], 2000)
     bary = torch.tensor(b, dtype=torch.float32)
-    sub = tgt[torch.from_numpy(rng.choice(len(tgt), min(600, len(tgt)), replace=False))]
+    sub = tgt[torch.from_numpy(rng.choice(len(tgt), min(n_sub, len(tgt)), replace=False))]
     # stage A: orientation + translation from many starts, mean pose and shape
     rot = _rand_rots(n_starts, seed).requires_grad_()
     with torch.no_grad():
@@ -147,13 +148,15 @@ def fit(mano, target, n_starts=24, iters_a=120, iters_b=400, trunc=0.02, w_pose=
     pca = torch.zeros(n_starts, 45, requires_grad=True)
     opt = torch.optim.Adam([rot, trans, pca], lr=0.02)
     for it in range(iters_a):
-        v, _ = mano(rot, pca, torch.zeros(n_starts, 10), trans)
+        if it < rigid:  # orientation and position only, at the mean pose
+            pca.grad = None
+        v, _ = mano(rot, pca if it >= rigid else pca.detach(), torch.zeros(n_starts, 10), trans)
         loss = _tdist(sub[None].expand(n_starts, -1, -1), v, trunc) + _tdist(v, sub[None].expand(n_starts, -1, -1), trunc) \
             + w_pose * (pca ** 2).sum(1)
         opt.zero_grad()
         loss.sum().backward()
         opt.step()
-    k = min(4, n_starts)
+    k = min(keep, n_starts)
     best = torch.argsort(loss.detach())[:k]
     # stage B: refine the best starts with pose and shape against all points and a MANO surface sample
     rot = rot.detach()[best].clone().requires_grad_()
