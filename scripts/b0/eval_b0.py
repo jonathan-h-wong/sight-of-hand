@@ -152,15 +152,17 @@ def mesh_points(mesh, n, seed):
     return surface(V, F, n, seed)[0]
 
 
-def fs(pred, gt, taus):
+def fs(pred, gt, taus, names=None):
+    """Chamfer and F-scores; keys f@<name>, names default to the thresholds themselves."""
+    names = names or [f"{t:g}" for t in taus]
     if len(pred) == 0:
-        return {"chamfer": np.nan, **{f"f@{t:g}": 0.0 for t in taus}}
+        return {"chamfer": np.nan, **{f"f@{n}": 0.0 for n in names}}
     d_pg = cKDTree(gt).query(pred)[0]
     d_gp = cKDTree(pred).query(gt)[0]
     o = {"chamfer": float((d_pg.mean() + d_gp.mean()) / 2)}
-    for t in taus:
+    for t, n in zip(taus, names):
         p, r = (d_pg <= t).mean(), (d_gp <= t).mean()
-        o[f"f@{t:g}"] = float(2 * p * r / (p + r)) if p + r > 0 else 0.0
+        o[f"f@{n}"] = float(2 * p * r / (p + r)) if p + r > 0 else 0.0
     return o
 
 
@@ -185,7 +187,8 @@ def mesh_metrics(pg, gt_h, gt_o, d_gt, d_moge):
     # scale-free: normalized units x 1000, thresholds tau / d_gt
     pn = pg["to_cam"](1.0) * 1000.0
     gn = gt * 1000.0 / d_gt
-    for k, v in fs(pn, gn, tuple(t / d_gt for t in TAUS_MM)).items():
+    # keyed by the mm threshold (f@2 = 2 mm / d_gt) so the column is the same for every frame
+    for k, v in fs(pn, gn, tuple(t / d_gt for t in TAUS_MM), [f"{t:g}" for t in TAUS_MM]).items():
         out[f"norm/soup/{k}"] = v
     return out
 
@@ -375,10 +378,30 @@ def main():
     print(json.dumps(summ["overall"], indent=1))
 
 
+def fix_norm_cols(df):
+    """Rows written before fs() took names keyed norm/soup F-scores by the per-frame threshold (f@<tau/d>);
+    fold them into f@<tau> by rank (the thresholds are TAUS_MM / d_gt in order)."""
+    bad = [c for c in df.columns if c.startswith("norm/soup/f@") and c[len("norm/soup/f@"):] not in
+           {f"{t:g}" for t in TAUS_MM}]
+    if not bad:
+        return df
+    df = df.copy()
+    thr = {c: float(c[len("norm/soup/f@"):]) for c in bad}
+    vals = np.full((len(df), len(TAUS_MM)), np.nan)
+    for i, (_, r) in enumerate(df[bad].iterrows()):
+        got = sorted((thr[c], r[c]) for c in bad if pd.notna(r[c]))
+        if len(got) == len(TAUS_MM):
+            vals[i] = [v for _, v in got]
+    df = df.drop(columns=bad)
+    for j, t in enumerate(TAUS_MM):
+        df[f"norm/soup/f@{t:g}"] = vals[:, j]
+    return df
+
+
 def summarize(df):
     """Medians per row/mode/matte/stratum. A mesh mode that produced no mesh (empty stage 1, decode error) is a
     failure, not a missing value: its F-scores count as 0 and `failed` reports the rate (Chamfer stays NaN)."""
-    df = df.copy()
+    df = fix_norm_cols(df)
     mesh = df["mode"] != "ss"
     probe = "gt_d/soup/f@2" if "gt_d/soup/f@2" in df else None
     failed = mesh & (df["error"].notna() if "error" in df else False)
@@ -417,8 +440,9 @@ def summarize(df):
         out["paired_gap"] = pd.DataFrame(gaps).groupby(["row", "mode"]).median().round(4).reset_index().to_dict("records")
     st = df[df.set == "stress"]
     if len(st) and "gt_d/hand/f@5" in st:
-        out["stress"] = st.groupby(["row", "mode", "matte"])[["gt_d/hand/f@5", "gt_d/soup/f@5"]].describe() \
-            .round(3).reset_index().astype(str).to_dict("records")
+        desc = st.groupby(["row", "mode", "matte"])[["gt_d/hand/f@5", "gt_d/soup/f@5"]].describe().round(3)
+        desc.columns = ["/".join(c) for c in desc.columns]
+        out["stress"] = desc.reset_index().to_dict("records")
     return out
 
 
