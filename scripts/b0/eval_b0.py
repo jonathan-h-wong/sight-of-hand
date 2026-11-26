@@ -237,7 +237,8 @@ def main():
     ap.add_argument("--d-max", type=float)
     ap.add_argument("--moge", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--save-meshes", type=int, default=12)
+    ap.add_argument("--save-meshes", type=int, default=12, help="save meshes for the first N frames")
+    ap.add_argument("--save-every", type=int, default=0, help="also save visuals for every k-th frame (0 = off)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--shard", default="0/1", help="i/n: evaluate every n-th frame starting at i (split across pods)")
     a = ap.parse_args()
@@ -325,7 +326,13 @@ def main():
                             cond = pipe.get_proj_cond_shape(cm, [image], coords, **cam)
                             torch.manual_seed(a.seed)
                             slat = pipe.sample_shape_slat(cond, pipe.models[f"shape_slat_flow_model_{res}"], coords)
-                        else:  # cascade
+                        elif mode == "cascade512":  # stage 1 -> stage 2 at 512 -> decode at 512 (the B0 path)
+                            torch.manual_seed(a.seed)
+                            coords = pipe.sample_sparse_structure(cond_ss, 32, 1)
+                            cl = pipe.get_proj_cond_shape(pipe.image_cond_model_shape_512, [image], coords, **cam)
+                            slat, res = pipe.sample_shape_slat(cl, pipe.models["shape_slat_flow_model_512"], coords), 512
+                            r["cascade/n_coords32"] = int(len(coords))
+                        else:  # cascade: stage 1 -> 512 -> stock-style 1024 refinement (untuned unless --lora-1024)
                             torch.manual_seed(a.seed)
                             coords = pipe.sample_sparse_structure(cond_ss, 32, 1)
                             cl = pipe.get_proj_cond_shape(pipe.image_cond_model_shape_512, [image], coords, **cam)
@@ -357,11 +364,24 @@ def main():
                         r.update({"d_moge": d_moge, "n_moge_px": n_moge})
                         if len(pg_grid):
                             r.update(mesh_metrics({"to_cam": to_cam}, gt_h, gt_o, d, d_moge))
-                        if done < a.save_meshes and matte == "oracle":
+                        save = done < a.save_meshes or (a.save_every and done % a.save_every == 0)
+                        if save and matte == "oracle":
                             import trimesh
                             trimesh.Trimesh(G.grid_to_cam(mesh.vertices.float().cpu().numpy(), d, L),
                                             mesh.faces.cpu().numpy(), process=False).export(
                                 out / "meshes" / f"{key}__{mode}__{a.row}.ply")
+                            vis = out / "vis" / key
+                            vis.mkdir(parents=True, exist_ok=True)
+                            if not (vis / "gt_soup.npz").exists():  # GT parts (camera metres), input, intrinsics
+                                np.savez_compressed(vis / "gt_soup.npz", hv=hv, hf=hf, ov=ov, of=of, K=K, d=d, L=L,
+                                                    pad=np.array([row.pad_x, row.pad_y, row.S]))
+                                image.save(vis / "input_oracle.png")
+                                Image.fromarray(frame_rgb).save(vis / "frame.jpg")
+                            if mode.startswith("cascade"):
+                                gtc = gt_dir / "shape_latents/shape_enc_next_dc_f16c32_fp16_512_view" / key / "view00.npz"
+                                np.savez_compressed(vis / f"coords32__{mode}__{a.row}.npz",
+                                                    pred=coords[:, 1:].cpu().numpy(),
+                                                    gt=np.load(gtc)["coords"] if gtc.exists() else np.zeros((0, 3)))
                     except Exception as e:  # a sample that fails is recorded, not fatal
                         r["error"] = repr(e)[:300]
                         print(f"[error] {key} {mode} {matte}: {e}", flush=True)
