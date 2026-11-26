@@ -106,6 +106,71 @@ def patch_partial_load(model):
     model.load_state_dict = load
 
 
+def mixed_coords(pred_dir, frac, extra):
+    """Stage 2 mixed training: with probability `frac` (when the frame has one) replace the GT 32^3 coordinates by the
+    stage 1 prediction (gen_pred_coords.py). Voxels in both keep their GT latent. Extra voxels (predicted, not in GT)
+    get the mean latent (0 after normalization); with extra='mask' they are left out of the loss, with extra='mean'
+    they are trained toward it. Missed voxels (GT, not predicted) are dropped. A 33rd feature channel carries the
+    per-token loss weight; masked_losses() strips it."""
+    import numpy as np
+    from pixal3d.datasets import structured_latent_shape as sls
+    orig = sls.SLatShapeView.get_instance
+    pred_dir = Path(pred_dir)
+
+    def get_instance(self, root, instance):
+        out = orig(self, root, instance)
+        c, f = out["coords"], out["feats"]
+        w = torch.ones(len(c), 1)
+        p = pred_dir / f"{instance}.npz"
+        if np.random.rand() < frac and p.exists():
+            P = torch.from_numpy(np.load(p)["coords"].astype(np.int32))
+            if len(P):
+                code = lambda x: (x[:, 0].long() * 32 + x[:, 1].long()) * 32 + x[:, 2].long()  # noqa: E731
+                lut = torch.full((32 ** 3,), -1, dtype=torch.long)
+                lut[code(c)] = torch.arange(len(c))
+                j = lut[code(P)]
+                hit = j >= 0
+                f = torch.where(hit[:, None], f[j.clamp(min=0)], torch.zeros(len(P), f.shape[1]))
+                w = (hit | torch.tensor(extra == "mean")).float()[:, None]
+                c = P
+        out["coords"], out["feats"] = c, torch.cat([f, w], 1)
+        return out
+
+    sls.SLatShapeView.get_instance = get_instance
+
+
+def masked_losses(trainer_cls):
+    """training_losses of the proj sparse trainer with a per-token loss weight in the last feature channel."""
+    import numpy as np
+    import torch.nn.functional as F
+    from easydict import EasyDict as edict
+
+    def training_losses(self, x_0, cond=None, **kwargs):
+        w = x_0.feats[:, -1]
+        x0 = x_0.replace(x_0.feats[:, :-1].contiguous())  # keeps the batch shape and the layout cache
+        noise = x0.replace(torch.randn_like(x0.feats))
+        t = self.sample_t(x0.shape[0]).to(x0.device).float()
+        x_t = self.diffuse(x0, t, noise=noise)
+        kwargs["coords"] = x0.coords
+        cond = self.get_cond(cond, **kwargs)
+        dk = {"concat_cond": kwargs["concat_cond"]} if "concat_cond" in kwargs else {}
+        pred = self.training_models["denoiser"](x_t, t * 1000, cond, **dk)
+        target = self.get_v(x0, noise, t)
+        se = ((pred.feats - target.feats) ** 2).mean(1)
+        terms = edict()
+        terms["mse"] = (se * w).sum() / w.sum().clamp(min=1)
+        terms["loss"] = terms["mse"]
+        terms["frac_weighted"] = w.mean()
+        per = np.array([((se[l] * w[l]).sum() / w[l].sum().clamp(min=1)).item() for l in x0.layout])
+        tb = np.digitize(t.cpu().numpy(), np.linspace(0, 1, 11)) - 1
+        for i in range(10):
+            if (tb == i).sum():
+                terms[f"bin_{i}"] = {"mse": per[tb == i].mean()}
+        return terms, {}
+
+    trainer_cls.training_losses = training_losses
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--stage", choices=list(STAGES), required=True)
@@ -125,6 +190,9 @@ def main():
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--pred-coords", help="dir of stage 1 predicted coords (<key>.npz) for stage 2 mixed training")
+    ap.add_argument("--pred-frac", type=float, default=0.5, help="share of samples that use predicted coords")
+    ap.add_argument("--extra-target", choices=["mask", "mean"], default="mask")
     ap.add_argument("--subset", help="text file of sample keys to keep (P4 overfit)")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb-project", default="sight-of-hand-b0")
@@ -150,6 +218,11 @@ def main():
         wandb_run = wandb.init(project=a.wandb_project, name=a.run_name or Path(a.out).name, config=cfg,
                                dir=a.out, resume="allow", id=(a.run_name or Path(a.out).name).replace("/", "_"))
 
+    if a.pred_coords:
+        assert a.stage.startswith("shape"), "--pred-coords is for stage 2"
+        mixed_coords(a.pred_coords, a.pred_frac, a.extra_target)
+        cfg["b0"]["mixed"] = {"pred_coords": a.pred_coords, "pred_frac": a.pred_frac, "extra_target": a.extra_target}
+        json.dump(cfg, open(Path(a.out) / "config.json", "w"), indent=1)
     ds = getattr(datasets, cfg["dataset"]["name"])(json.dumps(roots), **cfg["dataset"]["args"])
     if a.subset:
         keep = set(Path(a.subset).read_text().split())
@@ -170,6 +243,8 @@ def main():
 
     tcls = getattr(trainers, cfg["trainer"]["name"])
     lora_only_checkpoints(tcls)
+    if a.pred_coords:
+        masked_losses(tcls)
     step = None
     if a.resume:
         import glob
