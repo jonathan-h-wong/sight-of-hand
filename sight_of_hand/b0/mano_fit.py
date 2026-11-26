@@ -129,56 +129,68 @@ def _tdist(a, b, trunc):
     return d.clamp(max=trunc).mean(1)
 
 
-def fit(mano, target, n_starts=64, iters_a=100, iters_b=400, trunc=0.02, w_pose=1e-6, w_beta=1e-5, seed=0, keep=8,
-        rigid=40, n_sub=300):
-    """Fit MANO to target points (N,3) metres. Returns dict of numpy params, verts, joints and the final loss."""
-    tgt = torch.tensor(target, dtype=torch.float32)
+def fit_batch(mano, targets, n_starts=64, iters_a=100, iters_b=400, trunc=0.02, w_pose=1e-6, w_beta=1e-5, seed=0,
+              keep=8, rigid=40, n_sub=300, n_b=2000):
+    """Fit MANO (one side) to several target clouds at once, all frames x all starts in one batch (GPU if `mano` is
+    on one). targets: list of (N_i,3) metres. Stage A: n_starts random orientations, rigid for `rigid` iterations,
+    then pose, on n_sub points; stage B: the best `keep` starts per frame refine pose and shape against n_b points
+    resampled each iteration and a fixed MANO surface sample. Returns one dict per target (see fit)."""
+    dev = mano.v_template.device
     rng = np.random.default_rng(seed)
-    F = torch.from_numpy(mano.faces)
-    nf = len(F)
-    fidx = torch.from_numpy(rng.integers(0, nf, 2000))
-    b = rng.dirichlet([1, 1, 1], 2000)
-    bary = torch.tensor(b, dtype=torch.float32)
-    sub = tgt[torch.from_numpy(rng.choice(len(tgt), min(n_sub, len(tgt)), replace=False))]
-    # stage A: orientation + translation from many starts, mean pose and shape
-    rot = _rand_rots(n_starts, seed).requires_grad_()
+    nF, S = len(targets), n_starts
+    full = [torch.tensor(t, dtype=torch.float32, device=dev) for t in targets]
+    lens = torch.tensor([len(t) for t in full], device=dev)
+    pad = torch.zeros(nF, int(lens.max()), 3, device=dev)
+    for i, t in enumerate(full):
+        pad[i, :len(t)] = t
+    F = torch.from_numpy(mano.faces).to(dev)
+    fidx = torch.from_numpy(rng.integers(0, len(F), 2000)).to(dev)
+    bary = torch.tensor(rng.dirichlet([1, 1, 1], 2000), dtype=torch.float32, device=dev)
+    sub = torch.stack([t[torch.from_numpy(rng.choice(len(t), n_sub, replace=len(t) < n_sub)).to(dev)] for t in full])
+    subS = sub.repeat_interleave(S, 0)
+    rot = _rand_rots(S, seed).to(dev).repeat(nF, 1).requires_grad_()
+    z45, z10 = torch.zeros(nF * S, 45, device=dev), torch.zeros(nF * S, 10, device=dev)
     with torch.no_grad():
-        v0, _ = mano(rot, torch.zeros(n_starts, 45), torch.zeros(n_starts, 10), torch.zeros(n_starts, 3))
-    trans = (tgt.mean(0) - v0.mean(1)).clone().requires_grad_()
-    pca = torch.zeros(n_starts, 45, requires_grad=True)
+        v0, _ = mano(rot, z45, z10, torch.zeros(nF * S, 3, device=dev))
+    trans = (sub.mean(1).repeat_interleave(S, 0) - v0.mean(1)).clone().requires_grad_()
+    pca = z45.clone().requires_grad_()
     opt = torch.optim.Adam([rot, trans, pca], lr=0.02)
     for it in range(iters_a):
-        if it < rigid:  # orientation and position only, at the mean pose
-            pca.grad = None
-        v, _ = mano(rot, pca if it >= rigid else pca.detach(), torch.zeros(n_starts, 10), trans)
-        loss = _tdist(sub[None].expand(n_starts, -1, -1), v, trunc) + _tdist(v, sub[None].expand(n_starts, -1, -1), trunc) \
-            + w_pose * (pca ** 2).sum(1)
+        v, _ = mano(rot, pca if it >= rigid else pca.detach(), z10, trans)
+        loss = _tdist(subS, v, trunc) + _tdist(v, subS, trunc) + w_pose * (pca ** 2).sum(1)
         opt.zero_grad()
         loss.sum().backward()
         opt.step()
-    k = min(keep, n_starts)
-    best = torch.argsort(loss.detach())[:k]
-    # stage B: refine the best starts with pose and shape against all points and a MANO surface sample
+    k = min(keep, S)
+    best = (torch.argsort(loss.detach().view(nF, S), 1)[:, :k] + torch.arange(nF, device=dev)[:, None] * S).reshape(-1)
     rot = rot.detach()[best].clone().requires_grad_()
     trans = trans.detach()[best].clone().requires_grad_()
     pca = pca.detach()[best].clone().requires_grad_()
-    betas = torch.zeros(k, 10, requires_grad=True)
+    betas = torch.zeros(nF * k, 10, device=dev, requires_grad=True)
     opt = torch.optim.Adam([rot, trans, pca, betas], lr=0.01)
-    gen = torch.Generator().manual_seed(seed)
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    fr = torch.arange(nF, device=dev)[:, None]
     for it in range(iters_b):
-        T = tgt[torch.randint(len(tgt), (2000,), generator=gen)][None].expand(k, -1, -1)
+        j = (torch.rand(nF, n_b, generator=gen, device=dev) * lens[:, None]).long()
+        T = pad[fr, j].repeat_interleave(k, 0)
         if it == iters_b // 2:
             for pg in opt.param_groups:
                 pg["lr"] = 0.003
         v, _ = mano(rot, pca, betas, trans)
-        s = _surface(v, F, bary, fidx)
-        loss = _tdist(T, s, trunc) + _tdist(s, T, trunc) + w_pose * (pca ** 2).sum(1) + w_beta * (betas ** 2).sum(1)
+        s_ = _surface(v, F, bary, fidx)
+        loss = _tdist(T, s_, trunc) + _tdist(s_, T, trunc) + w_pose * (pca ** 2).sum(1) + w_beta * (betas ** 2).sum(1)
         opt.zero_grad()
         loss.sum().backward()
         opt.step()
-    i = int(torch.argmin(loss.detach()))
+    L = loss.detach().view(nF, k)
+    pick = (L.argmin(1) + torch.arange(nF, device=dev) * k)
     with torch.no_grad():
-        v, j = mano(rot[i:i + 1], pca[i:i + 1], betas[i:i + 1], trans[i:i + 1])
-    return {"rot": rot[i].detach().numpy(), "pca": pca[i].detach().numpy(), "betas": betas[i].detach().numpy(),
-            "trans": trans[i].detach().numpy(), "verts": v[0].numpy(), "joints": j[0].numpy(),
-            "loss": float(loss[i].detach())}
+        v, jn = mano(rot[pick], pca[pick], betas[pick], trans[pick])
+    c = lambda x: x.detach().cpu().numpy()  # noqa: E731
+    return [{"rot": c(rot[p]), "pca": c(pca[p]), "betas": c(betas[p]), "trans": c(trans[p]), "verts": c(v[i]),
+             "joints": c(jn[i]), "loss": float(L[i].min())} for i, p in enumerate(pick.tolist())]
+
+
+def fit(mano, target, **kw):
+    """Fit MANO to target points (N,3) metres. Returns dict of numpy params, verts, joints and the final loss."""
+    return fit_batch(mano, [target], **kw)[0]
