@@ -12,4 +12,4 @@ for v in SS 512 1024; do
 done
 cd $PX
 python3 /root/code/scripts/b0/eval_b0.py --val /workspace/b0/val --out $OUT/eval_${ROW} --row $ROW \
-  --amodal-index /workspace/amodal_index.parquet --modes ${MODES:-ss,gt512,cascade} --moge $L ${EVAL_ARGS:-}
+  --amodal-index /workspace/amodal_index.parquet --modes ${MODES:-ss,gt512,cascade} $([ "${NOMOGE:-0}" = 1 ] || echo --moge) $L ${EVAL_ARGS:-}
