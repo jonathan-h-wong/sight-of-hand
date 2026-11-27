@@ -209,6 +209,7 @@ def main():
     ap.add_argument("--extra-target", choices=["mask", "mean"], default="mask")
     ap.add_argument("--swap-frac", type=float, default=0.0, help="synthetic boundary swap share for non-pred samples")
     ap.add_argument("--swap-prob", type=float, default=0.0, help="probability of the synthetic swap for non-pred samples")
+    ap.add_argument("--init-lora", help="LoRA state dict to start from (fresh optimizer and EMA)")
     ap.add_argument("--subset", help="text file of sample keys to keep (P4 overfit)")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb-project", default="sight-of-hand-b0")
@@ -252,6 +253,9 @@ def main():
     model = getattr(models, mcfg["name"])(**mcfg["args"]).cuda()
     load_released(model, STAGES[a.stage]["weights"])
     names = lora.inject(model, a.rank, a.alpha)
+    if a.init_lora:
+        lora.load_lora(model, torch.load(a.init_lora, map_location="cuda"))
+        print(f"LoRA initialised from {a.init_lora}", flush=True)
     lora.freeze_base(model)
     patch_partial_load(model)
     tot, trn = lora.count(model)

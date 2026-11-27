@@ -1,7 +1,7 @@
 # Stage 2 (512) LoRA mixed training: same recipe as B0's train_shape512 (batch 16 split 2, LR 2e-4, 8K steps),
 # with --pred-coords from the gen_pred_* jobs. Env: GEN_JOBS (space-separated job names), PRED_FRAC, EXTRA, STEPS,
-# SMOKE=1 (use whatever predictions are uploaded so far, without waiting for the jobs to finish), INIT_FROM (a job whose
-# out/shape512 checkpoints to continue from), TRAIN_EXTRA (extra train_b0.py flags).
+# SMOKE=1 (use whatever predictions are uploaded so far, without waiting for the jobs to finish), INIT_LORA (S3 URI of LoRA
+# weights to start from; fresh optimizer), TRAIN_EXTRA (extra train_b0.py flags).
 set -ex
 E=s3://xray-hands/train/b0_dexycb_s0_v1/encoded
 W=s3://xray-hands/work/b0/jobs
@@ -29,8 +29,9 @@ print("train preds", len(a), "voxel IoU median", np.median(a[:, 0]), "p10", np.p
 PY
 cat $OUT/pred_stats.txt
 aws s3 sync --quiet $J/out/shape512 $OUT/shape512 || true
-if [ -n "${INIT_FROM:-}" ] && ! ls $OUT/shape512/ckpts/misc_step*.pt >/dev/null 2>&1; then
-  aws s3 sync --quiet $W/$INIT_FROM/out/shape512/ckpts $OUT/shape512/ckpts
+if [ -n "${INIT_LORA:-}" ]; then
+  aws s3 cp --quiet $INIT_LORA /workspace/init_lora.pt
+  TRAIN_EXTRA="${TRAIN_EXTRA:-} --init-lora /workspace/init_lora.pt"
 fi
 cd $PX
 python3 /root/code/scripts/b0/train_b0.py --stage shape512 --data /workspace/b0 --out $OUT/shape512 --steps ${STEPS:-8000} \
