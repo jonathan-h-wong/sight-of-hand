@@ -1,7 +1,8 @@
-# Evaluation on s0 val. Env: ROW (zeroshot|b0), LORA_SS / LORA_512 / LORA_1024 (S3 URIs, optional), MODES, EVAL_ARGS.
+# Evaluation on s0 val (SPLIT=train for a training-frame fit check). Env: ROW (zeroshot|b0), LORA_SS / LORA_512 / LORA_1024 (S3 URIs, optional), MODES, EVAL_ARGS.
 set -ex
 E=s3://xray-hands/train/b0_dexycb_s0_v1/encoded
-mkdir -p /workspace/b0 /workspace/lora && aws s3 cp --quiet $E/val.tar - | tar -xf - -C /workspace/b0
+SPLIT=${SPLIT:-val}
+mkdir -p /workspace/b0 /workspace/lora && aws s3 cp --quiet $E/$SPLIT.tar - | tar -xf - -C /workspace/b0
 aws s3 cp --quiet s3://xray-hands/masks/amodal_v1/dexycb/index.parquet /workspace/amodal_index.parquet
 pip install -q git+https://github.com/microsoft/MoGe.git
 pip install -q "huggingface_hub>=0.34,<1.0"  # MoGe pulls a hub version that transformers 4.57 rejects
@@ -11,5 +12,5 @@ for v in SS 512 1024; do
   if [ -n "$u" ]; then f=/workspace/lora/$v.pt; aws s3 cp --quiet $u $f; L="$L --lora-$(echo $v | tr A-Z a-z) $f"; fi
 done
 cd $PX
-python3 /root/code/scripts/b0/eval_b0.py --val /workspace/b0/val --out $OUT/eval_${ROW} --row $ROW \
+python3 /root/code/scripts/b0/eval_b0.py --val /workspace/b0/$SPLIT --split $SPLIT --out $OUT/eval_${ROW} --row $ROW \
   --amodal-index /workspace/amodal_index.parquet --modes ${MODES:-ss,gt512,cascade} $([ "${NOMOGE:-0}" = 1 ] || echo --moge) $L ${EVAL_ARGS:-}

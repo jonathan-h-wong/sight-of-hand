@@ -53,10 +53,10 @@ OCC_BINS = [0, 0.1, 0.3, 0.6, 1.01]
 OCC_LABELS = ["0-10", "10-30", "30-60", ">60"]
 
 
-def pick_eval_set(idx, val_keys, a):
-    """Stratified + paired + stress keys from the val split."""
+def pick_eval_set(idx, val_keys, a, split="val"):
+    """Stratified + paired + stress keys from one split (val by default)."""
     amodal = pd.read_parquet(a.amodal_index) if a.amodal_index else None
-    v = idx[idx.split == "val"].copy()
+    v = idx[idx.split == split].copy()
     if amodal is not None:
         am = amodal.assign(serial=amodal.cam.astype(str))[["seq", "serial", "frame", "hand_visible_frac",
                                                            "obj_occluded_by_hand_frac", "hand_occluded_by_obj_frac"]]
@@ -227,6 +227,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--val", required=True, help="encode_b0.py output for the val split")
     ap.add_argument("--prefix", default="train/b0_dexycb_s0_v1")
+    ap.add_argument("--split", default="val", help="index split to sample frames from (val, or train for a fit check)")
     ap.add_argument("--data", default="/workspace/data")
     ap.add_argument("--amodal-index", help="local parquet of s3://xray-hands/masks/amodal_v1/dexycb/index.parquet")
     ap.add_argument("--out", required=True)
@@ -261,8 +262,10 @@ def main():
     out = Path(a.out)
     (out / "meshes").mkdir(parents=True, exist_ok=True)
     idx = pd.read_parquet(io.BytesIO(s3.get_object(Bucket=BUCKET, Key=f"{a.prefix}/index.parquet")["Body"].read()))
-    kept, _ = apply_filters(idx, "val", a)
-    vidx, sets = pick_eval_set(idx, set(kept.key), a)
+    kept, _ = apply_filters(idx, a.split, a)
+    lat1024 = Path(a.val) / "shape_latents/shape_enc_next_dc_f16c32_fp16_1024_view"
+    kept = kept[[(lat1024 / k).exists() for k in kept.key]]  # encoded frames only (train: penetration-filtered)
+    vidx, sets = pick_eval_set(idx, set(kept.key), a, a.split)
     keys = list(sets)
     if a.limit:
         keys = keys[:a.limit]
