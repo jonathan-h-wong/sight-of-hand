@@ -218,6 +218,8 @@ def masked_losses(trainer_cls, occ=None):
         terms["frac_weighted"] = w.mean()
         if occ is not None and occ["lam"] > 0:
             dec, mean, std = occ["decoder"], occ["mean"], occ["std"]
+            for q in dec.parameters():
+                q.grad = None
             tt = torch.cat([t[i].expand(l.stop - l.start) for i, l in enumerate(x0.layout)])
             x0h = x_t.feats - tt[:, None] * pred.feats
             from pixal3d.modules.sparse import SparseTensor
@@ -314,7 +316,9 @@ def ss_occ_losses(trainer_cls, occ):
     trainer_cls.training_losses = training_losses
 
 
-def load_frozen(path):
+def load_frozen(path, grad_params=False):
+    """A decoder kept out of training. grad_params=True leaves requires_grad on (flex_gemm's sparse conv backward
+    assumes the weight needs a gradient); it is never given to the optimizer and its grads are cleared every step."""
     from pixal3d import models
     m = models.from_pretrained(path).cuda().eval()
     if hasattr(m, "convert_to_fp32"):
@@ -322,7 +326,7 @@ def load_frozen(path):
     m.float()
     m.dtype = torch.float32
     for q in m.parameters():
-        q.requires_grad_(False)
+        q.requires_grad_(grad_params)
     return m
 
 
@@ -417,7 +421,7 @@ def main():
     occ = None
     if a.occ_loss > 0:
         dec = "TencentARC/Pixal3D/ckpts/" + ("ss_dec_conv3d_16l8_fp16" if a.stage == "ss64" else "shape_dec_next_dc_f16c32_fp16")
-        occ = {"lam": a.occ_loss, "ramp": a.occ_ramp, "hand_w": a.occ_hand_w, "decoder": load_frozen(dec)}
+        occ = {"lam": a.occ_loss, "ramp": a.occ_ramp, "hand_w": a.occ_hand_w, "decoder": load_frozen(dec, grad_params=a.stage != "ss64")}
         if a.stage != "ss64":
             nz = cfg["dataset"]["args"]["normalization"]
             occ["mean"] = torch.tensor(nz["mean"]).float().cuda()
