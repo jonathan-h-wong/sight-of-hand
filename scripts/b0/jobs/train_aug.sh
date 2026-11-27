@@ -8,8 +8,11 @@ J=$W/jobs/$JOB
 mkdir -p /workspace/b0 /workspace/hand_vox64 $OUT
 aws s3 cp --quiet $E/train.tar - | tar -xf - -C /workspace/b0
 if [ "${HAND:-0}" = 1 ]; then
-  if [ "$(aws s3 ls $W/hand_vox64/DONE)" ]; then
+  if [ "$(aws s3 ls $W/hand_vox64.tar)" ]; then
+    aws s3 cp --quiet $W/hand_vox64.tar - | tar -xf - -C /workspace
+  elif [ "$(aws s3 ls $W/hand_vox64/DONE)" ]; then
     aws s3 sync --quiet $W/hand_vox64 /workspace/hand_vox64
+    tar -cf - -C /workspace hand_vox64 | aws s3 cp - $W/hand_vox64.tar
   else
     mkdir -p /workspace/mano && aws s3 cp --quiet s3://xray-hands/raw/mano/mano_v1_2.zip /workspace/mano/ \
       && unzip -q -o /workspace/mano/mano_v1_2.zip -d /workspace/mano
