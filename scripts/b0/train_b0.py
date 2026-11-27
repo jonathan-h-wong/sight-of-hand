@@ -106,12 +106,15 @@ def patch_partial_load(model):
     model.load_state_dict = load
 
 
-def mixed_coords(pred_dir, frac, extra):
+def mixed_coords(pred_dir, frac, extra, swap_frac=0.0, swap_prob=0.0):
     """Stage 2 mixed training: with probability `frac` (when the frame has one) replace the GT 32^3 coordinates by the
     stage 1 prediction (gen_pred_coords.py). Voxels in both keep their GT latent. Extra voxels (predicted, not in GT)
     get the mean latent (0 after normalization); with extra='mask' they are left out of the loss, with extra='mean'
     they are trained toward it. Missed voxels (GT, not predicted) are dropped. A 33rd feature channel carries the
-    per-token loss weight; masked_losses() strips it."""
+    per-token loss weight; masked_losses() strips it.
+    Samples that do not use a prediction (no file, or the frac draw) get, with probability swap_prob, a synthetic
+    boundary perturbation of the GT set: swap_frac of the GT voxels dropped and as many 6-neighbour non-GT voxels
+    added (mean latent), the error pattern stage 1 makes."""
     import numpy as np
     from pixal3d.datasets import structured_latent_shape as sls
     orig = sls.SLatShapeView.get_instance
@@ -133,6 +136,17 @@ def mixed_coords(pred_dir, frac, extra):
                 f = torch.where(hit[:, None], f[j.clamp(min=0)], torch.zeros(len(P), f.shape[1]))
                 w = (hit | torch.tensor(extra == "mean")).float()[:, None]
                 c = P
+        elif swap_frac > 0 and np.random.rand() < swap_prob and len(c) > 4:
+            keep = torch.from_numpy(np.random.rand(len(c)) >= swap_frac)
+            G_ = {tuple(x) for x in c.tolist()}
+            offs = np.r_[np.eye(3, dtype=int), -np.eye(3, dtype=int)]
+            nb = {tuple(x) for x in (c.numpy()[:, None, :] + offs[None]).reshape(-1, 3).tolist()}
+            nb = np.array([x for x in nb if x not in G_ and min(x) >= 0 and max(x) < 32], np.int32).reshape(-1, 3)
+            k = min(len(nb), int((~keep).sum()))
+            add = torch.from_numpy(nb[np.random.choice(len(nb), k, replace=False)]) if k else torch.zeros(0, 3, dtype=torch.int32)
+            f = torch.cat([f[keep], torch.zeros(k, f.shape[1])])
+            w = torch.cat([torch.ones(int(keep.sum()), 1), torch.full((k, 1), float(extra == "mean"))])
+            c = torch.cat([c[keep], add.to(c.dtype)])
         out["coords"], out["feats"] = c, torch.cat([f, w], 1)
         return out
 
@@ -193,6 +207,8 @@ def main():
     ap.add_argument("--pred-coords", help="dir of stage 1 predicted coords (<key>.npz) for stage 2 mixed training")
     ap.add_argument("--pred-frac", type=float, default=0.5, help="share of samples that use predicted coords")
     ap.add_argument("--extra-target", choices=["mask", "mean"], default="mask")
+    ap.add_argument("--swap-frac", type=float, default=0.0, help="synthetic boundary swap share for non-pred samples")
+    ap.add_argument("--swap-prob", type=float, default=0.0, help="probability of the synthetic swap for non-pred samples")
     ap.add_argument("--subset", help="text file of sample keys to keep (P4 overfit)")
     ap.add_argument("--wandb", action="store_true")
     ap.add_argument("--wandb-project", default="sight-of-hand-b0")
@@ -220,8 +236,9 @@ def main():
 
     if a.pred_coords:
         assert a.stage.startswith("shape"), "--pred-coords is for stage 2"
-        mixed_coords(a.pred_coords, a.pred_frac, a.extra_target)
-        cfg["b0"]["mixed"] = {"pred_coords": a.pred_coords, "pred_frac": a.pred_frac, "extra_target": a.extra_target}
+        mixed_coords(a.pred_coords, a.pred_frac, a.extra_target, a.swap_frac, a.swap_prob)
+        cfg["b0"]["mixed"] = {"pred_coords": a.pred_coords, "pred_frac": a.pred_frac, "extra_target": a.extra_target,
+                              "swap_frac": a.swap_frac, "swap_prob": a.swap_prob}
         json.dump(cfg, open(Path(a.out) / "config.json", "w"), indent=1)
     ds = getattr(datasets, cfg["dataset"]["name"])(json.dumps(roots), **cfg["dataset"]["args"])
     if a.subset:
