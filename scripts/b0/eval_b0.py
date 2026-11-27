@@ -116,6 +116,15 @@ class _NoRembg:
         raise RuntimeError("background removal is not used in B0 evaluation")
 
 
+def dilate6(c, R):
+    """coordinate set (N,3) dilated by one voxel (6-neighbourhood), clipped to the R^3 grid"""
+    c = np.asarray(c, int)
+    offs = np.r_[np.zeros((1, 3), int), np.eye(3, dtype=int), -np.eye(3, dtype=int)]
+    d = (c[:, None, :] + offs[None]).reshape(-1, 3)
+    d = d[((d >= 0) & (d < R)).all(1)]
+    return np.unique(d, axis=0)
+
+
 def build_pipeline(a):
     import pixal3d.pipelines.rembg as rembg
     rembg.BiRefNet = _NoRembg
@@ -317,18 +326,24 @@ def main():
                                       "ss/n_pred": int(occ.sum()), "ss/n_gt": int(gtg.sum())})
                             rows.append(r)
                             continue
-                        if mode in ("gt512", "gt1024"):
-                            res = int(mode[2:])
+                        if mode in ("gt512", "gt1024", "gt512dil"):
+                            res = 512 if mode == "gt512dil" else int(mode[2:])
                             gtc = np.load(gt_dir / f"shape_latents/shape_enc_next_dc_f16c32_fp16_{res}_view" / key / "view00.npz")["coords"]
+                            if mode == "gt512dil":
+                                gtc = dilate6(gtc, 32)
                             coords = torch.cat([torch.zeros(len(gtc), 1, dtype=torch.int32),
                                                 torch.from_numpy(gtc.astype(np.int32))], 1).cuda()
                             cm = pipe.image_cond_model_shape_512 if res == 512 else pipe.image_cond_model_shape_1024
                             cond = pipe.get_proj_cond_shape(cm, [image], coords, **cam)
                             torch.manual_seed(a.seed)
                             slat = pipe.sample_shape_slat(cond, pipe.models[f"shape_slat_flow_model_{res}"], coords)
-                        elif mode == "cascade512":  # stage 1 -> stage 2 at 512 -> decode at 512 (the B0 path)
+                        elif mode in ("cascade512", "cascade512dil"):  # stage 1 -> stage 2 at 512 -> decode at 512
                             torch.manual_seed(a.seed)
                             coords = pipe.sample_sparse_structure(cond_ss, 32, 1)
+                            if mode == "cascade512dil":  # the stage 1 set dilated by one voxel (dilation-trained stage 2)
+                                dc = dilate6(coords[:, 1:].cpu().numpy(), 32)
+                                coords = torch.cat([torch.zeros(len(dc), 1, dtype=torch.int32),
+                                                    torch.from_numpy(dc.astype(np.int32))], 1).cuda()
                             cl = pipe.get_proj_cond_shape(pipe.image_cond_model_shape_512, [image], coords, **cam)
                             slat, res = pipe.sample_shape_slat(cl, pipe.models["shape_slat_flow_model_512"], coords), 512
                             r["cascade/n_coords32"] = int(len(coords))

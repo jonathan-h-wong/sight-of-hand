@@ -106,62 +106,103 @@ def patch_partial_load(model):
     model.load_state_dict = load
 
 
-def mixed_coords(pred_dir, frac, extra, swap_frac=0.0, swap_prob=0.0):
-    """Stage 2 mixed training: with probability `frac` (when the frame has one) replace the GT 32^3 coordinates by the
-    stage 1 prediction (gen_pred_coords.py). Voxels in both keep their GT latent. Extra voxels (predicted, not in GT)
-    get the mean latent (0 after normalization); with extra='mask' they are left out of the loss, with extra='mean'
-    they are trained toward it. Missed voxels (GT, not predicted) are dropped. A 33rd feature channel carries the
-    per-token loss weight; masked_losses() strips it.
-    Samples that do not use a prediction (no file, or the frac draw) get, with probability swap_prob, a synthetic
-    boundary perturbation of the GT set: swap_frac of the GT voxels dropped and as many 6-neighbour non-GT voxels
-    added (mean latent), the error pattern stage 1 makes."""
+def mixed_coords(pred_dir, frac, extra, swap_frac=0.0, swap_prob=0.0, dilate_prob=0.0, hand_dir=None):
+    """Stage 2 coordinate augmentation. Each sample, in this order of precedence:
+      prediction  with probability `frac` (when the frame has one) the stage 1 predicted 32^3 set (gen_pred_coords.py)
+      swap        else with probability swap_prob a synthetic boundary swap of the GT set (swap_frac dropped, as many
+                  6-neighbour non-GT voxels added)
+      dilate      else with probability dilate_prob the GT set dilated by one voxel (all 6-neighbours added)
+      clean       else the GT set.
+    Voxels in GT keep their GT latent; added voxels get the mean latent (0 after normalization) and are trained toward
+    it with extra='mean' or left out of the loss with extra='mask'; missed voxels are dropped. Two feature channels are
+    appended: the per-token loss weight and a hand flag (the 32^3 cell contains a GT hand cell from
+    gen_hand_vox.py; 0 without hand_dir). masked_losses() strips them."""
     import numpy as np
     from pixal3d.datasets import structured_latent_shape as sls
     orig = sls.SLatShapeView.get_instance
-    pred_dir = Path(pred_dir)
+    pred_dir = Path(pred_dir) if pred_dir else None
+    hand_dir = Path(hand_dir) if hand_dir else None
+    offs = np.r_[np.eye(3, dtype=int), -np.eye(3, dtype=int)]
+
+    def neighbours(c):
+        G_ = {tuple(x) for x in c.tolist()}
+        nb = {tuple(x) for x in (c.numpy()[:, None, :] + offs[None]).reshape(-1, 3).tolist()}
+        return np.array([x for x in nb if x not in G_ and min(x) >= 0 and max(x) < 32], np.int32).reshape(-1, 3)
 
     def get_instance(self, root, instance):
         out = orig(self, root, instance)
         c, f = out["coords"], out["feats"]
         w = torch.ones(len(c), 1)
-        p = pred_dir / f"{instance}.npz"
-        if np.random.rand() < frac and p.exists():
+        ew = float(extra == "mean")
+        p = pred_dir / f"{instance}.npz" if pred_dir else None
+        if p is not None and np.random.rand() < frac and p.exists() and len(np.load(p)["coords"]):
             P = torch.from_numpy(np.load(p)["coords"].astype(np.int32))
-            if len(P):
-                code = lambda x: (x[:, 0].long() * 32 + x[:, 1].long()) * 32 + x[:, 2].long()  # noqa: E731
-                lut = torch.full((32 ** 3,), -1, dtype=torch.long)
-                lut[code(c)] = torch.arange(len(c))
-                j = lut[code(P)]
-                hit = j >= 0
-                f = torch.where(hit[:, None], f[j.clamp(min=0)], torch.zeros(len(P), f.shape[1]))
-                w = (hit | torch.tensor(extra == "mean")).float()[:, None]
-                c = P
+            code = lambda x: (x[:, 0].long() * 32 + x[:, 1].long()) * 32 + x[:, 2].long()  # noqa: E731
+            lut = torch.full((32 ** 3,), -1, dtype=torch.long)
+            lut[code(c)] = torch.arange(len(c))
+            j = lut[code(P)]
+            hit = j >= 0
+            f = torch.where(hit[:, None], f[j.clamp(min=0)], torch.zeros(len(P), f.shape[1]))
+            w = (hit | torch.tensor(extra == "mean")).float()[:, None]
+            c = P
         elif swap_frac > 0 and np.random.rand() < swap_prob and len(c) > 4:
             keep = torch.from_numpy(np.random.rand(len(c)) >= swap_frac)
-            G_ = {tuple(x) for x in c.tolist()}
-            offs = np.r_[np.eye(3, dtype=int), -np.eye(3, dtype=int)]
-            nb = {tuple(x) for x in (c.numpy()[:, None, :] + offs[None]).reshape(-1, 3).tolist()}
-            nb = np.array([x for x in nb if x not in G_ and min(x) >= 0 and max(x) < 32], np.int32).reshape(-1, 3)
+            nb = neighbours(c)
             k = min(len(nb), int((~keep).sum()))
             add = torch.from_numpy(nb[np.random.choice(len(nb), k, replace=False)]) if k else torch.zeros(0, 3, dtype=torch.int32)
             f = torch.cat([f[keep], torch.zeros(k, f.shape[1])])
-            w = torch.cat([torch.ones(int(keep.sum()), 1), torch.full((k, 1), float(extra == "mean"))])
+            w = torch.cat([torch.ones(int(keep.sum()), 1), torch.full((k, 1), ew)])
             c = torch.cat([c[keep], add.to(c.dtype)])
-        out["coords"], out["feats"] = c, torch.cat([f, w], 1)
+        elif dilate_prob > 0 and np.random.rand() < dilate_prob:
+            add = torch.from_numpy(neighbours(c))
+            f = torch.cat([f, torch.zeros(len(add), f.shape[1])])
+            w = torch.cat([w, torch.full((len(add), 1), ew)])
+            c = torch.cat([c, add.to(c.dtype)])
+        hand = torch.zeros(len(c), 1)
+        if hand_dir is not None and (hand_dir / f"{instance}.npz").exists():
+            h = np.load(hand_dir / f"{instance}.npz")["coords"].astype(int) // 2
+            hs = np.zeros(32 ** 3, bool)
+            hs[(h[:, 0] * 32 + h[:, 1]) * 32 + h[:, 2]] = True
+            cc = c.long().numpy()
+            hand = torch.from_numpy(hs[(cc[:, 0] * 32 + cc[:, 1]) * 32 + cc[:, 2]].astype(np.float32))[:, None]
+        out["coords"], out["feats"] = c, torch.cat([f, w, hand], 1)
         return out
 
     sls.SLatShapeView.get_instance = get_instance
 
 
-def masked_losses(trainer_cls):
-    """training_losses of the proj sparse trainer with a per-token loss weight in the last feature channel."""
+def _ramp(self, occ):
+    return occ["lam"] * min(1.0, self.step / max(occ["ramp"], 1))
+
+
+def _dice(p, y, eps=1.0):
+    return 1 - (2 * (p * y).sum() + eps) / (p.sum() + y.sum() + eps)
+
+
+def masked_losses(trainer_cls, occ=None):
+    """training_losses of the proj sparse trainer (stage 2) with a per-token loss weight and a hand flag in the last
+    two feature channels. With occ (decoded-occupancy loss): x0_hat = x_t - t v_hat (exact for sigma_min -> 0) goes
+    through the frozen shape decoder's first block level, whose subdivision logits (which of the 8 64^3 children of
+    each 32^3 cell are occupied) are trained by BCE + Dice toward those of the GT latent, per sample weighted by
+    (1 - t)^2, hand tokens up-weighted by occ['hand_w'], coefficient ramped from 0 to occ['lam'] over occ['ramp'] steps."""
     import numpy as np
     import torch.nn.functional as F
     from easydict import EasyDict as edict
 
+    def level0(dec, x):
+        h = dec.from_latent(x)
+        h = h.type(dec.dtype)
+        res = dec.blocks[0]
+        for j, block in enumerate(res):
+            if j == len(res) - 1:
+                h, sub = block(h)
+            else:
+                h = block(h)
+        return sub.feats.float()
+
     def training_losses(self, x_0, cond=None, **kwargs):
-        w = x_0.feats[:, -1]
-        x0 = x_0.replace(x_0.feats[:, :-1].contiguous())  # keeps the batch shape and the layout cache
+        w, hand = x_0.feats[:, -2], x_0.feats[:, -1]
+        x0 = x_0.replace(x_0.feats[:, :-2].contiguous())  # keeps the batch shape and the layout cache
         noise = x0.replace(torch.randn_like(x0.feats))
         t = self.sample_t(x0.shape[0]).to(x0.device).float()
         x_t = self.diffuse(x0, t, noise=noise)
@@ -175,6 +216,22 @@ def masked_losses(trainer_cls):
         terms["mse"] = (se * w).sum() / w.sum().clamp(min=1)
         terms["loss"] = terms["mse"]
         terms["frac_weighted"] = w.mean()
+        if occ is not None and occ["lam"] > 0:
+            dec, mean, std = occ["decoder"], occ["mean"], occ["std"]
+            tt = torch.cat([t[i].expand(l.stop - l.start) for i, l in enumerate(x0.layout)])
+            x0h = x_t.feats - tt[:, None] * pred.feats
+            with torch.no_grad():
+                tgt = (level0(dec, x0.replace(x0.feats * std + mean)) > 0).float()
+            lg = level0(dec, x0.replace(x0h * std + mean))
+            tw = (1 - tt) ** 2 * (1 + (occ["hand_w"] - 1) * hand)
+            bce = F.binary_cross_entropy_with_logits(lg, tgt, reduction="none").mean(1)
+            pr = torch.sigmoid(lg)
+            dl = torch.stack([_dice(pr[l], tgt[l]) for l in x0.layout])
+            occ_l = (bce * tw).sum() / tw.sum().clamp(min=1e-6) + (dl * (1 - t) ** 2).mean()
+            lam = _ramp(self, occ)
+            terms["occ"] = occ_l
+            terms["occ_lam"] = torch.tensor(lam)
+            terms["loss"] = terms["mse"] + lam * occ_l
         per = np.array([((se[l] * w[l]).sum() / w[l].sum().clamp(min=1)).item() for l in x0.layout])
         tb = np.digitize(t.cpu().numpy(), np.linspace(0, 1, 11)) - 1
         for i in range(10):
@@ -183,6 +240,88 @@ def masked_losses(trainer_cls):
         return terms, {}
 
     trainer_cls.training_losses = training_losses
+
+
+def ss_occ_data(hand_dir):
+    """Stage 1 dataset: add the GT 64^3 occupancy (the 1024 shape latent's coordinates) and the GT hand cells."""
+    import numpy as np
+    from pixal3d.datasets import sparse_structure_latent as ssl
+    orig = ssl.SparseStructureLatentView.get_instance
+    hand_dir = Path(hand_dir) if hand_dir else None
+
+    def get_instance(self, root, instance):
+        out = orig(self, root, instance)
+        occ = np.zeros((64,) * 3, np.uint8)
+        c = np.load(Path(root["ss_latent"]).parents[1] / "shape_latents/shape_enc_next_dc_f16c32_fp16_1024_view"
+                    / instance / "view00.npz")["coords"].astype(int)
+        occ[tuple(c.T)] = 1
+        hand = np.zeros((64,) * 3, np.uint8)
+        if hand_dir is not None and (hand_dir / f"{instance}.npz").exists():
+            h = np.load(hand_dir / f"{instance}.npz")["coords"].astype(int)
+            if len(h):
+                hand[tuple(h.T)] = 1
+        out["occ64"], out["hand64"] = torch.from_numpy(occ)[None], torch.from_numpy(hand & occ)[None]
+        return out
+
+    ssl.SparseStructureLatentView.get_instance = get_instance
+
+
+def ss_occ_losses(trainer_cls, occ):
+    """training_losses of the proj dense trainer (stage 1) + the decoded-occupancy loss: x0_hat = x_t - t v_hat through
+    the frozen conv3d decoder -> 64^3 logits; BCE (hand cells up-weighted by occ['hand_w']) + Dice against the GT
+    occupancy, per sample weighted by (1 - t)^2, coefficient ramped to occ['lam'] over occ['ramp'] steps."""
+    import numpy as np
+    import torch.nn.functional as F
+    from easydict import EasyDict as edict
+
+    def training_losses(self, x_0, cond=None, **kwargs):
+        occ64 = kwargs.pop("occ64").float()
+        hand64 = kwargs.pop("hand64").float()
+        noise = torch.randn_like(x_0)
+        t = self.sample_t(x_0.shape[0]).to(x_0.device).float()
+        x_t = self.diffuse(x_0, t, noise=noise)
+        cond = self.get_cond(cond, **kwargs)
+        pred = self.training_models["denoiser"](x_t, t * 1000, cond)
+        target = self.get_v(x_0, noise, t)
+        terms = edict()
+        terms["mse"] = F.mse_loss(pred, target)
+        tv = t.view(-1, *[1] * (x_0.dim() - 1))
+        lg = occ["decoder"]((x_t - tv * pred).float()).float()
+        wcell = 1 + (occ["hand_w"] - 1) * hand64
+        bce = (F.binary_cross_entropy_with_logits(lg, occ64, reduction="none") * wcell).flatten(1).sum(1) \
+            / wcell.flatten(1).sum(1)
+        pr = torch.sigmoid(lg)
+        dl = torch.stack([_dice(pr[i], occ64[i]) for i in range(len(pr))])
+        tw = (1 - t) ** 2
+        occ_l = ((bce + dl) * tw).mean()
+        lam = _ramp(self, occ)
+        terms["occ"] = occ_l
+        terms["occ_lam"] = torch.tensor(lam)
+        with torch.no_grad():
+            hit = ((lg > 0).float() * occ64).flatten(1).sum(1)
+            terms["occ_iou"] = (hit / (((lg > 0).float() + occ64).clamp(max=1).flatten(1).sum(1) + 1)).mean()
+            terms["hand_rec"] = (((lg > 0).float() * hand64).flatten(1).sum(1) / (hand64.flatten(1).sum(1) + 1)).mean()
+        terms["loss"] = terms["mse"] + lam * occ_l
+        mse_i = np.array([F.mse_loss(pred[i], target[i]).item() for i in range(x_0.shape[0])])
+        tb = np.digitize(t.cpu().numpy(), np.linspace(0, 1, 11)) - 1
+        for i in range(10):
+            if (tb == i).sum():
+                terms[f"bin_{i}"] = {"mse": mse_i[tb == i].mean()}
+        return terms, {}
+
+    trainer_cls.training_losses = training_losses
+
+
+def load_frozen(path):
+    from pixal3d import models
+    m = models.from_pretrained(path).cuda().eval()
+    if hasattr(m, "convert_to_fp32"):
+        m.convert_to_fp32()
+    m.float()
+    m.dtype = torch.float32
+    for q in m.parameters():
+        q.requires_grad_(False)
+    return m
 
 
 def main():
@@ -209,6 +348,11 @@ def main():
     ap.add_argument("--extra-target", choices=["mask", "mean"], default="mask")
     ap.add_argument("--swap-frac", type=float, default=0.0, help="synthetic boundary swap share for non-pred samples")
     ap.add_argument("--swap-prob", type=float, default=0.0, help="probability of the synthetic swap for non-pred samples")
+    ap.add_argument("--dilate-prob", type=float, default=0.0, help="stage 2: probability of the one-voxel GT dilation")
+    ap.add_argument("--hand-vox", help="dir of gen_hand_vox.py outputs (hand cells, for hand up-weighting)")
+    ap.add_argument("--occ-loss", type=float, default=0.0, help="decoded-occupancy loss coefficient (after ramp)")
+    ap.add_argument("--occ-ramp", type=int, default=2000, help="steps over which the coefficient ramps from 0")
+    ap.add_argument("--occ-hand-w", type=float, default=5.0, help="hand cell / token weight in the occupancy BCE")
     ap.add_argument("--init-lora", help="LoRA state dict to start from (fresh optimizer and EMA)")
     ap.add_argument("--subset", help="text file of sample keys to keep (P4 overfit)")
     ap.add_argument("--wandb", action="store_true")
@@ -235,12 +379,16 @@ def main():
         wandb_run = wandb.init(project=a.wandb_project, name=a.run_name or Path(a.out).name, config=cfg,
                                dir=a.out, resume="allow", id=(a.run_name or Path(a.out).name).replace("/", "_"))
 
-    if a.pred_coords:
-        assert a.stage.startswith("shape"), "--pred-coords is for stage 2"
-        mixed_coords(a.pred_coords, a.pred_frac, a.extra_target, a.swap_frac, a.swap_prob)
+    stage2_aug = a.stage.startswith("shape") and (a.pred_coords or a.dilate_prob > 0 or a.occ_loss > 0)
+    if stage2_aug:
+        mixed_coords(a.pred_coords, a.pred_frac, a.extra_target, a.swap_frac, a.swap_prob, a.dilate_prob, a.hand_vox)
         cfg["b0"]["mixed"] = {"pred_coords": a.pred_coords, "pred_frac": a.pred_frac, "extra_target": a.extra_target,
-                              "swap_frac": a.swap_frac, "swap_prob": a.swap_prob}
-        json.dump(cfg, open(Path(a.out) / "config.json", "w"), indent=1)
+                              "swap_frac": a.swap_frac, "swap_prob": a.swap_prob, "dilate_prob": a.dilate_prob}
+    if a.stage == "ss64" and a.occ_loss > 0:
+        ss_occ_data(a.hand_vox)
+    if a.occ_loss > 0:
+        cfg["b0"]["occ_loss"] = {"lam": a.occ_loss, "ramp": a.occ_ramp, "hand_w": a.occ_hand_w, "hand_vox": a.hand_vox}
+    json.dump(cfg, open(Path(a.out) / "config.json", "w"), indent=1)
     ds = getattr(datasets, cfg["dataset"]["name"])(json.dumps(roots), **cfg["dataset"]["args"])
     if a.subset:
         keep = set(Path(a.subset).read_text().split())
@@ -264,8 +412,18 @@ def main():
 
     tcls = getattr(trainers, cfg["trainer"]["name"])
     lora_only_checkpoints(tcls)
-    if a.pred_coords:
-        masked_losses(tcls)
+    occ = None
+    if a.occ_loss > 0:
+        dec = "TencentARC/Pixal3D/ckpts/" + ("ss_dec_conv3d_16l8_fp16" if a.stage == "ss64" else "shape_dec_next_dc_f16c32_fp16")
+        occ = {"lam": a.occ_loss, "ramp": a.occ_ramp, "hand_w": a.occ_hand_w, "decoder": load_frozen(dec)}
+        if a.stage != "ss64":
+            nz = cfg["dataset"]["args"]["normalization"]
+            occ["mean"] = torch.tensor(nz["mean"]).float().cuda()
+            occ["std"] = torch.tensor(nz["std"]).float().cuda()
+    if stage2_aug:
+        masked_losses(tcls, occ)
+    elif a.stage == "ss64" and occ is not None:
+        ss_occ_losses(tcls, occ)
     step = None
     if a.resume:
         import glob
