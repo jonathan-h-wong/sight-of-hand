@@ -220,9 +220,11 @@ def masked_losses(trainer_cls, occ=None):
             dec, mean, std = occ["decoder"], occ["mean"], occ["std"]
             tt = torch.cat([t[i].expand(l.stop - l.start) for i, l in enumerate(x0.layout)])
             x0h = x_t.feats - tt[:, None] * pred.feats
+            from pixal3d.modules.sparse import SparseTensor
+            # fresh tensors: a shared spatial cache built under no_grad lacks flex_gemm's backward fields
+            lg = level0(dec, SparseTensor(feats=(x0h * std + mean).float(), coords=x0.coords.clone()))
             with torch.no_grad():
-                tgt = (level0(dec, x0.replace(x0.feats * std + mean)) > 0).float()
-            lg = level0(dec, x0.replace(x0h * std + mean))
+                tgt = (level0(dec, SparseTensor(feats=(x0.feats * std + mean).float(), coords=x0.coords.clone())) > 0).float()
             tw = (1 - tt) ** 2 * (1 + (occ["hand_w"] - 1) * hand)
             bce = F.binary_cross_entropy_with_logits(lg, tgt, reduction="none").mean(1)
             pr = torch.sigmoid(lg)
